@@ -555,6 +555,19 @@ def route(path):
         "/api/v1/models/lora/profiles": cp_lora_profiles,
         "/api/v1/recording/list": cp_recording_list,
         "/api/v1/train/status": cp_train_status,
+        # ADR-271 sign-in capability probe. `/oauth/status` is extension-less, so
+        # without this entry the request falls through to the SPA fallback and the
+        # settings panel receives index.html -- surfacing in the UI as
+        # "Could not reach the server (Unexpected token '<', ...)". This
+        # deployment has no OAuth backend, so answer the capability question
+        # explicitly instead of pretending the endpoint is missing.
+        "/oauth/status": lambda: {
+            "signed_in": False,
+            "browser_signin": False,
+            "auth_required": False,
+            "account": None,
+            "scope": None,
+        },
     }
     builder = static_routes.get(path.rstrip("/") or "/")
     if builder is None:
@@ -980,6 +993,16 @@ class Handler(BaseHTTPRequestHandler):
         if handled is not None:
             payload, code = handled
             self._send_json(payload, code)
+            return
+        if path.startswith("/oauth/"):
+            # /oauth/start and /oauth/logout are full-page navigations in the UI.
+            # There is no OAuth backend here: answer JSON 404 so the UI takes its
+            # documented "server predates ADR-271" branch, instead of silently
+            # landing on index.html and looking like a broken sign-in.
+            self._send_json(
+                {"detail": "oauth not configured on this deployment", "path": path},
+                404,
+            )
             return
         if path.startswith("/api/"):
             # Unknown API surface: answer honestly-empty rather than 404 so the UI

@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#21808d">
+    <meta name="description" content="基于 WiFi 的隔墙人体姿态估计、生命体征检测与存在感知">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>WiFi DensePose：隔墙人体追踪</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="manifest" href="manifest.json">
+  <style>
+    /* ===== Nicesemi 品牌标识 / 页脚 ===== */
+    .ns-brandbar { display: flex; align-items: center; padding-top: 16px; }
+    .ns-logo--index { height: 44px; width: auto; display: block; }
+    @media (max-width: 640px) { .ns-logo--index { height: 34px; } }
+    .ns-footer { text-align: center; font-size: 12px; color: var(--color-text-secondary, #8a94a6);
+                 padding: 28px 16px 26px; letter-spacing: .3px; }
+  </style>
+</head>
+<body>
+    <!-- 跳到主要内容 link for keyboard/screen reader users -->
+    <a href="#dashboard" class="skip-to-content">跳到主要内容</a>
+
+    <div class="container">
+        <!-- Nicesemi 品牌标识 -->
+        <div class="ns-brandbar">
+            <img class="ns-logo ns-logo--index" src="assets/nicesemi-logo.png" alt="Nicesemi 拟世">
+        </div>
+
+        <!-- Header -->
+        <header class="header" role="banner">
+            <h1>WiFi DensePose</h1>
+            <p class="subtitle" data-i18n="dashboard.subtitle">利用 WiFi 信号隔墙追踪人体</p>
+            <div class="header-info">
+                <span class="api-version" aria-label="API version"></span>
+                <span class="api-environment" aria-label="Environment"></span>
+                <span class="overall-health" role="status" aria-live="polite" aria-label="System health"></span>
+            </div>
+        </header>
+
+        <!-- Navigation -->
+        <nav class="nav-tabs" role="tablist" aria-label="Main navigation">
+            <button class="nav-tab active" data-tab="dashboard" role="tab" aria-selected="true" aria-controls="dashboard">仪表盘</button>
+            <button class="nav-tab" data-tab="hardware" role="tab" aria-selected="false" aria-controls="hardware">硬件</button>
+            <button class="nav-tab" data-tab="demo" role="tab" aria-selected="false" aria-controls="demo">实时演示</button>
+            <button class="nav-tab" data-tab="architecture" role="tab" aria-selected="false" aria-controls="architecture">系统架构</button>
+            <button class="nav-tab" data-tab="performance" role="tab" aria-selected="false" aria-controls="performance">性能分析</button>
+            <button class="nav-tab" data-tab="applications" role="tab" aria-selected="false" aria-controls="applications">应用场景</button>
+            <button class="nav-tab" data-tab="sensing" role="tab" aria-selected="false" aria-controls="sensing">感知</button>
+            <button class="nav-tab" data-tab="training" role="tab" aria-selected="false" aria-controls="training">模型训练</button>
+            <a href="pose-fusion.html" class="nav-tab" style="text-decoration:none">姿态融合</a>
+            <a href="observatory.html" class="nav-tab" style="text-decoration:none">观测站</a>
+        </nav>
+
+        <!-- 仪表盘 Tab -->
+        <section id="dashboard" class="tab-content active" role="tabpanel" aria-labelledby="dashboard">
+            <div class="hero-section">
+                <h2 data-i18n="dashboard.title">基于 WiFi 的革命性人体姿态检测</h2>
+                <p class="hero-description">
+                    AI 仅凭 WiFi 信号就能隔墙追踪你的全身动作。卡内基梅隆大学的研究者训练了一个神经网络，把基础 WiFi 信号转换为精细的人体骨架模型，NiceSemi基于此神经网络创造了WiFi DensePose系统π RuView，并且在Github上开源。
+                </p>
+                
+                <!-- Error container -->
+                <div class="error-container" style="display: none;"></div>
+
+                <!-- Live Status Panel -->
+                <div class="live-status-panel">
+                    <h3 data-i18n="dashboard.status">系统状态</h3>
+                    <div class="status-grid">
+                        <div class="component-status" data-component="api">
+                            <span class="component-name">API 服务</span>
+                            <span class="status-text">-</span>
+                            <span class="status-message"></span>
+                        </div>
+                        <div class="component-status" data-component="hardware">
+                            <span class="component-name">硬件</span>
+                            <span class="status-text">-</span>
+                            <span class="status-message"></span>
+                        </div>
+                        <div class="component-status" data-component="inference">
+                            <span class="component-name">推理引擎</span>
+                            <span class="status-text">-</span>
+                            <span class="status-message"></span>
+                        </div>
+                        <div class="component-status" data-component="streaming">
+                            <span class="component-name">数据流</span>
+                            <span class="status-text">-</span>
+                            <span class="status-message"></span>
+                        </div>
+                        <div class="component-status" data-component="datasource" id="dashboard-datasource">
+                            <span class="component-name">数据源</span>
+                            <span class="status-text">-</span>
+                            <span class="status-message"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 系统指标 -->
+                <div class="system-metrics-panel">
+                    <h3 data-i18n="dashboard.metrics">系统指标</h3>
+                    <div class="metrics-grid">
+                        <div class="metric-item">
+                            <span class="metric-label" data-i18n="metrics.cpu">CPU 占用</span>
+                            <div class="progress-bar" data-type="cpu">
+                                <div class="progress-fill normal" style="width: 0%"></div>
+                            </div>
+                            <span class="cpu-usage">0%</span>
+                        </div>
+                        <div class="metric-item">
+                            <span class="metric-label" data-i18n="metrics.memory">内存占用</span>
+                            <div class="progress-bar" data-type="memory">
+                                <div class="progress-fill normal" style="width: 0%"></div>
+                            </div>
+                            <span class="memory-usage">0%</span>
+                        </div>
+                        <div class="metric-item">
+                            <span class="metric-label" data-i18n="metrics.disk">磁盘占用</span>
+                            <div class="progress-bar" data-type="disk">
+                                <div class="progress-fill normal" style="width: 0%"></div>
+                            </div>
+                            <span class="disk-usage">0%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 功能特性 Status -->
+                <div class="features-panel">
+                    <h3 data-i18n="dashboard.features">功能特性</h3>
+                    <div class="features-status"></div>
+                </div>
+
+                <!-- 实时统计 -->
+                <div class="live-stats-panel">
+                    <h3 data-i18n="dashboard.liveStats">实时统计</h3>
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <span class="stat-label">在场人数</span>
+                            <span class="person-count">0</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">平均置信度</span>
+                            <span class="avg-confidence">0%</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">累计检测数</span>
+                            <span class="detection-count">0</span>
+                        </div>
+                    </div>
+                    
+                    <div class="zones-panel">
+                        <h4>区域占用</h4>
+                        <div class="zones-summary"></div>
+                    </div>
+                </div>
+                
+                <div class="key-benefits">
+                    <div class="benefit-card">
+                        <div class="benefit-icon">🏠</div>
+                        <h3>隔墙感知</h3>
+                        <p>可穿透实体遮挡，无需视线直连</p>
+                    </div>
+                    <div class="benefit-card">
+                        <div class="benefit-icon">🔒</div>
+                        <h3>隐私友好</h3>
+                        <p>不使用摄像头或录像，仅分析 WiFi 信号</p>
+                    </div>
+                    <div class="benefit-card">
+                        <div class="benefit-icon">⚡</div>
+                        <h3>实时</h3>
+                        <p>以 100Hz 采样率实时映射 24 个人体部位</p>
+                    </div>
+                    <div class="benefit-card">
+                        <div class="benefit-icon">💰</div>
+                        <h3>低成本</h3>
+                        <p>基于 30 美元的商用 WiFi 硬件搭建</p>
+                    </div>
+                </div>
+
+                <div class="system-stats">
+                    <div class="stat" data-stat="body-regions">
+                        <span class="stat-value">24</span>
+                        <span class="stat-label">人体部位</span>
+                    </div>
+                    <div class="stat" data-stat="sampling-rate">
+                        <span class="stat-value">100Hz</span>
+                        <span class="stat-label">采样率</span>
+                    </div>
+                    <div class="stat" data-stat="accuracy">
+                        <span class="stat-value">87.2%</span>
+                        <span class="stat-label">准确率（AP@50）</span>
+                    </div>
+                    <div class="stat" data-stat="hardware-cost">
+                        <span class="stat-value">$30</span>
+                        <span class="stat-label">硬件成本</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 硬件 Tab -->
+        <section id="hardware" class="tab-content" role="tabpanel" aria-labelledby="hardware" aria-hidden="true">
+            <h2>硬件配置</h2>
+            
+            <div class="hardware-grid">
+                <div class="antenna-section">
+                    <h3>3×3 天线阵列</h3>
+                    <p class="help-text">点击天线可切换其状态</p>
+                    <div class="antenna-array">
+                        <div class="antenna-grid">
+                            <div class="antenna tx active" data-type="TX1"></div>
+                            <div class="antenna tx active" data-type="TX2"></div>
+                            <div class="antenna tx active" data-type="TX3"></div>
+                            <div class="antenna rx active" data-type="RX1"></div>
+                            <div class="antenna rx active" data-type="RX2"></div>
+                            <div class="antenna rx active" data-type="RX3"></div>
+                            <div class="antenna rx active" data-type="RX4"></div>
+                            <div class="antenna rx active" data-type="RX5"></div>
+                            <div class="antenna rx active" data-type="RX6"></div>
+                        </div>
+                        <div class="antenna-legend">
+                            <div class="legend-item">
+                                <div class="legend-color tx"></div>
+                                <span>发射天线（3）</span>
+                            </div>
+                            <div class="legend-item">
+                                <div class="legend-color rx"></div>
+                                <span>接收天线（6）</span>
+                            </div>
+                        </div>
+                        <div class="array-status"></div>
+                    </div>
+                </div>
+
+                <div class="config-section">
+                    <h3>WiFi 参数</h3>
+                    <div class="config-grid">
+                        <div class="config-item">
+                            <label>频段</label>
+                            <div class="config-value">2.4GHz ± 20MHz</div>
+                        </div>
+                        <div class="config-item">
+                            <label>子载波</label>
+                            <div class="config-value">30</div>
+                        </div>
+                        <div class="config-item">
+                            <label>采样率</label>
+                            <div class="config-value">100 Hz</div>
+                        </div>
+                        <div class="config-item">
+                            <label>总成本</label>
+                            <div class="config-value">$30</div>
+                        </div>
+                    </div>
+
+                    <div class="csi-data">
+                        <h4>实时 CSI 数据</h4>
+                        <div class="csi-display">
+                            <div class="csi-row">
+                                <span>幅度：</span>
+                                <div class="csi-bar">
+                                    <div class="csi-fill amplitude" style="width: 75%"></div>
+                                </div>
+                                <span class="csi-value">0.75</span>
+                            </div>
+                            <div class="csi-row">
+                                <span>相位：</span>
+                                <div class="csi-bar">
+                                    <div class="csi-fill phase" style="width: 60%"></div>
+                                </div>
+                                <span class="csi-value">1.2π</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Demo Tab -->
+        <section id="demo" class="tab-content" role="tabpanel" aria-labelledby="demo" aria-hidden="true">
+            <h2>实时演示</h2>
+            
+            <div class="demo-controls">
+                <button id="startDemo" class="btn btn--primary">开始数据流</button>
+                <button id="stopDemo" class="btn btn--secondary" disabled>停止数据流</button>
+                <div class="demo-status">
+                    <span class="status status--info" id="demoStatus">就绪</span>
+                </div>
+            </div>
+
+            <div class="demo-grid">
+                <div class="signal-panel">
+                    <h3>WiFi 信号分析</h3>
+                    <div class="signal-display">
+                        <canvas id="signalCanvas" width="400" height="200"></canvas>
+                    </div>
+                    <div class="signal-metrics">
+                        <div class="metric">
+                            <span>信号强度：</span>
+                            <span id="signalStrength">-45 dBm</span>
+                        </div>
+                        <div class="metric">
+                            <span>处理延迟：</span>
+                            <span id="latency">12 ms</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="pose-panel">
+                    <h3>人体姿态检测</h3>
+                    <div class="pose-display">
+                        <canvas id="poseCanvas" width="400" height="300"></canvas>
+                    </div>
+                    <div class="detection-info">
+                        <div class="info-item">
+                            <span>检测到人数：</span>
+                            <span id="personCount">0</span>
+                        </div>
+                        <div class="info-item">
+                            <span>置信度：</span>
+                            <span id="confidence">0.0%</span>
+                        </div>
+                        <div class="info-item">
+                            <span>关键点：</span>
+                            <span id="keypoints">0/0</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 系统架构 Tab -->
+        <section id="architecture" class="tab-content" role="tabpanel" aria-labelledby="architecture" aria-hidden="true">
+            <h2>系统架构</h2>
+            
+            <div class="architecture-flow">
+                <img src="https://pplx-res.cloudinary.com/image/upload/v1748813853/gpt4o_images/m7zztcttnue7vaxclvuw.png" 
+                     alt="WiFi DensePose 架构图" class="architecture-image">
+                
+                <div class="flow-steps">
+                    <div class="step-card" data-step="1">
+                        <div class="step-number">1</div>
+                        <h3>CSI 输入</h3>
+                        <p>从 WiFi 天线阵列采集信道状态信息</p>
+                    </div>
+                    <div class="step-card" data-step="2">
+                        <div class="step-number">2</div>
+                        <h3>相位净化</h3>
+                        <p>去除硬件相关噪声并归一化信号相位</p>
+                    </div>
+                    <div class="step-card" data-step="3">
+                        <div class="step-number">3</div>
+                        <h3>模态转换</h3>
+                        <p>使用 CNN 将 WiFi 信号转换为视觉表征</p>
+                    </div>
+                    <div class="step-card" data-step="4">
+                        <div class="step-number">4</div>
+                        <h3>DensePose-RCNN</h3>
+                        <p>提取人体姿态关键点与身体部位分割</p>
+                    </div>
+                    <div class="step-card" data-step="5">
+                        <div class="step-number">5</div>
+                        <h3>骨架输出</h3>
+                        <p>生成最终的人体姿态骨架可视化</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 性能分析 Tab -->
+        <section id="performance" class="tab-content" role="tabpanel" aria-labelledby="performance" aria-hidden="true">
+            <h2>性能分析</h2>
+            
+            <div class="performance-chart">
+                <img src="https://pplx-res.cloudinary.com/image/upload/v1748813924/pplx_code_interpreter/af6ef268_nsauu6.jpg" 
+                     alt="性能对比图" class="chart-image">
+            </div>
+
+            <div class="performance-grid">
+                <div class="performance-card">
+                    <h3>基于 WiFi（相同布局）</h3>
+                    <div class="metric-list">
+                        <div class="metric-item">
+                            <span>平均精度：</span>
+                            <span class="metric-value">43.5%</span>
+                        </div>
+                        <div class="metric-item">
+                            <span>AP@50:</span>
+                            <span class="metric-value success">87.2%</span>
+                        </div>
+                        <div class="metric-item">
+                            <span>AP@75:</span>
+                            <span class="metric-value">44.6%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="performance-card">
+                    <h3>基于图像（对照组）</h3>
+                    <div class="metric-list">
+                        <div class="metric-item">
+                            <span>平均精度：</span>
+                            <span class="metric-value success">84.7%</span>
+                        </div>
+                        <div class="metric-item">
+                            <span>AP@50:</span>
+                            <span class="metric-value success">94.4%</span>
+                        </div>
+                        <div class="metric-item">
+                            <span>AP@75:</span>
+                            <span class="metric-value success">77.1%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="limitations-section">
+                    <h3>优势与局限</h3>
+                    <div class="pros-cons">
+                        <div class="pros">
+                            <h4>优势</h4>
+                            <ul>
+                                <li>可隔墙检测</li>
+                                <li>保护隐私</li>
+                                <li>不受光照影响</li>
+                                <li>硬件成本低</li>
+                                <li>复用现有 WiFi</li>
+                            </ul>
+                        </div>
+                        <div class="cons">
+                            <h4>局限</h4>
+                            <ul>
+                                <li>更换环境布局后性能下降</li>
+                                <li>需要支持 WiFi 的设备</li>
+                                <li>训练需要同步采集的数据</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 应用场景 Tab -->
+        <section id="applications" class="tab-content" role="tabpanel" aria-labelledby="applications" aria-hidden="true">
+            <h2>实际应用场景</h2>
+            
+            <div class="applications-grid">
+                <div class="app-card">
+                    <div class="app-icon">👴</div>
+                    <h3>独居老人看护</h3>
+                    <p>在不侵犯隐私的前提下监测老人跌倒或紧急状况，跟踪活动规律并识别日常异常。</p>
+                    <div class="app-features">
+                        <span class="feature-tag">跌倒检测</span>
+                        <span class="feature-tag">活动监测</span>
+                        <span class="feature-tag">紧急告警</span>
+                    </div>
+                </div>
+
+                <div class="app-card">
+                    <div class="app-icon">🏠</div>
+                    <h3>家庭安防</h3>
+                    <p>无需可见摄像头即可发现入侵者并守护家庭安全，跟踪多人并识别可疑活动模式。</p>
+                    <div class="app-features">
+                        <span class="feature-tag">入侵检测</span>
+                        <span class="feature-tag">多人追踪</span>
+                        <span class="feature-tag">隐形监测</span>
+                    </div>
+                </div>
+
+                <div class="app-card">
+                    <div class="app-icon">🏥</div>
+                    <h3>医疗患者监护</h3>
+                    <p>在医院与护理机构监测患者，通过活动分析跟踪生命体征并发现健康风险。</p>
+                    <div class="app-features">
+                        <span class="feature-tag">生命体征分析</span>
+                        <span class="feature-tag">活动追踪</span>
+                        <span class="feature-tag">健康告警</span>
+                    </div>
+                </div>
+
+                <div class="app-card">
+                    <div class="app-icon">🏢</div>
+                    <h3>智慧楼宇人员感知</h3>
+                    <p>通过掌握人员在室规律来优化楼宇能耗，自动联动照明、暖通与安防系统。</p>
+                    <div class="app-features">
+                        <span class="feature-tag">能耗优化</span>
+                        <span class="feature-tag">在室追踪</span>
+                        <span class="feature-tag">智能联动</span>
+                    </div>
+                </div>
+
+                <div class="app-card">
+                    <div class="app-icon">🥽</div>
+                    <h3>AR/VR 应用</h3>
+                    <p>无需佩戴额外传感器或摄像头，即可为虚拟现实与增强现实提供全身动捕。</p>
+                    <div class="app-features">
+                        <span class="feature-tag">全身动捕</span>
+                        <span class="feature-tag">无传感器</span>
+                        <span class="feature-tag">沉浸体验</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="implementation-note">
+                <h3>落地注意事项</h3>
+                <p>WiFi DensePose 能力突出，但真正落地仍需仔细评估环境布置、数据隐私合规与系统标定，才能达到最佳效果。</p>
+            </div>
+        </section>
+
+        <!-- 感知 Tab -->
+        <section id="sensing" class="tab-content" role="tabpanel" aria-labelledby="sensing" aria-hidden="true"></section>
+
+        <!-- 模型训练 Tab -->
+        <section id="training" class="tab-content" role="tabpanel" aria-labelledby="training" aria-hidden="true">
+            <div class="tab-header">
+                <h2>模型训练</h2>
+                <p>录制 CSI 数据、训练姿态估计模型并管理 .rvf 文件</p>
+            </div>
+            <div id="training-container" style="display: flex; gap: 20px; flex-wrap: wrap;">
+                <div id="training-panel-container" style="flex: 1; min-width: 400px;"></div>
+                <div id="model-panel-container" style="flex: 1; min-width: 350px; max-width: 450px;"></div>
+            </div>
+        </section>
+    </div>
+
+    <!-- 页脚 -->
+    <footer class="ns-footer ns-footer--flow">© 2026 Nicesemi 拟世</footer>
+
+    <!-- Error Toast -->
+    <div id="globalErrorToast" class="error-toast"></div>
+
+    <!-- Load application scripts as modules -->
+    <script type="module" src="app.js"></script>
+</body>
+</html>

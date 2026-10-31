@@ -1,0 +1,47 @@
+# π RuView — cloud / PaaS image
+#
+# Single-container build intended for free hosting tiers (Render, Koyeb,
+# Cloud Run, Zeabur, Fly.io). Differences vs docker/Dockerfile.python.cn:
+#   * public PyPI (no CN mirror) — target platforms build outside mainland CHN
+#   * no uvicorn/fastapi (the gateway is stdlib http.server, ws_server pulls
+#     `websockets` itself)
+#   * runs as non-root
+#   * binds $PORT so the platform can route traffic
+#   * HEALTHCHECK hits /health
+
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Layer-cache friendly: lockfile first, source after.
+COPY archive/v1/requirements-lock.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt websockets
+
+# Only the sensing package is needed: ws_server imports nothing outside
+# v1.src.sensing, so the 10 MB proof bundle (archive/v1/data) stays out of the
+# image and out of the build context.
+COPY archive/v1/__init__.py /app/v1/__init__.py
+COPY archive/v1/src/ /app/v1/src/
+COPY ui/ /app/ui/
+COPY gateway.py /app/gateway.py
+COPY docker/cloud-entrypoint.sh /app/cloud-entrypoint.sh
+
+RUN chmod +x /app/cloud-entrypoint.sh \
+    && useradd --create-home --uid 10001 ruview \
+    && chown -R ruview:ruview /app
+
+USER ruview
+
+ENV PORT=8080
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','8080'), timeout=4)" || exit 1
+
+CMD ["/app/cloud-entrypoint.sh"]

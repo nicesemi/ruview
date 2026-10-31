@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RuView — 双模态姿态估计</title>
+  <link rel="stylesheet" href="pose-fusion/css/style.css?v=13">
+  <style>
+    /* ===== Nicesemi 品牌标识 / 页脚 ===== */
+    .ns-logo--pf { height: 40px; width: auto; display: block; flex: 0 0 auto; }
+    @media (max-width: 640px) { .ns-logo--pf { height: 30px; } }
+    .main-grid { height: calc(100vh - 102px) !important; }
+    .ns-footer--fixed { position: static; text-align: center; font-size: 11px;
+                        letter-spacing: .4px; padding: 6px 0 8px;
+                        color: rgba(232,236,224,.45);
+                        font-family: 'JetBrains Mono', monospace; }
+    @media (max-width: 640px) { .main-grid { height: auto !important; } }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <img class="ns-logo ns-logo--pf" src="assets/nicesemi-logo.png" alt="Nicesemi 拟世">
+      <div class="logo"><span class="pi">&pi;</span> RuView</div>
+      <div class="header-title">双模态姿态估计 — 实时视频 + WiFi CSI 融合</div>
+    </div>
+    <div class="header-right">
+      <select id="mode-select" class="mode-select">
+        <option value="dual">双模态（视频 + CSI）</option>
+        <option value="video">仅视频</option>
+        <option value="csi">仅 CSI（WiFi）</option>
+      </select>
+      <div class="status-badge">
+        <span id="status-dot" class="status-dot offline"></span>
+        <span id="status-label">就绪</span>
+      </div>
+      <span id="fps-display" class="fps-badge">-- FPS</span>
+      <a href="index.html" class="back-link">&larr; 返回仪表盘</a>
+      <a href="observatory.html" class="back-link">观测站 &rarr;</a>
+    </div>
+  </header>
+
+  <!-- Main Grid -->
+  <div class="main-grid">
+
+    <!-- 视频 + Skeleton Panel -->
+    <div class="video-panel">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="skeleton-canvas"></canvas>
+      <div class="video-overlay-label" id="mode-label">双模态融合</div>
+
+      <div id="camera-prompt" class="camera-prompt">
+        <div class="camera-prompt-label" id="prompt-mode-label">双模态融合</div>
+        <p>启用摄像头即可进行实时视频姿态估计。<br>
+           或切换到 <strong>仅 CSI</strong> 模式，改用 WiFi 感知。</p>
+        <button id="start-camera-btn">启用摄像头</button>
+      </div>
+    </div>
+
+    <!-- Side Panels -->
+    <div class="side-panels">
+
+      <!-- 融合置信度 -->
+      <div class="panel">
+        <div class="panel-title">&#9670; 融合置信度</div>
+        <div class="fusion-bars">
+          <div class="bar-row">
+            <span class="bar-label">视频</span>
+            <div class="bar-track"><div class="bar-fill video" id="video-bar" style="width:0%"></div></div>
+            <span class="bar-value" id="video-bar-val">0%</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">CSI</span>
+            <div class="bar-track"><div class="bar-fill csi" id="csi-bar" style="width:0%"></div></div>
+            <span class="bar-value" id="csi-bar-val">0%</span>
+          </div>
+          <div class="bar-row">
+            <span class="bar-label">融合</span>
+            <div class="bar-track"><div class="bar-fill fused" id="fused-bar" style="width:0%"></div></div>
+            <span class="bar-value" id="fused-bar-val">0%</span>
+          </div>
+        </div>
+        <div style="margin-top:8px; font-size:10px; color:var(--text-label)">
+          跨模态相似度： <span id="cross-modal-sim" style="color:var(--green-glow)">0.000</span>
+        </div>
+      </div>
+
+      <!-- CSI Heatmap -->
+      <div class="panel">
+        <div class="panel-title">&#9670; CSI 幅度热力图</div>
+        <div class="csi-canvas-wrapper">
+          <canvas id="csi-canvas" width="320" height="100"></canvas>
+        </div>
+      </div>
+
+      <!-- RSSI 信号强度 -->
+      <div class="panel">
+        <div class="panel-title">&#9670; RSSI 信号强度</div>
+        <div class="rssi-row">
+          <div class="rssi-gauge">
+            <div class="rssi-bar-track">
+              <div class="rssi-bar-fill" id="rssi-bar" style="width:0%"></div>
+            </div>
+            <div class="rssi-values">
+              <span class="rssi-dbm" id="rssi-value">-- dBm</span>
+              <span class="rssi-quality" id="rssi-quality">--</span>
+            </div>
+          </div>
+          <canvas id="rssi-sparkline" width="160" height="32"></canvas>
+        </div>
+      </div>
+
+      <!-- Embedding Space -->
+      <div class="panel">
+        <div class="panel-title">&#9670; 嵌入空间（二维投影）</div>
+        <div class="embedding-canvas-wrapper">
+          <canvas id="embedding-canvas" width="320" height="100"></canvas>
+        </div>
+      </div>
+
+      <!-- RuVector Attention Pipeline -->
+      <div class="panel">
+        <div class="panel-title">&#9670; RuVector WASM 注意力流水线</div>
+        <div class="rv-pipeline">
+          <div class="rv-stage" id="rv-flash">Flash</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-mha">MHA</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-hyp">Hyper</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-lin">Linear</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-moe">MoE</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-lg">L+G</div>
+        </div>
+        <div class="rv-stats">
+          <span>能量： <span id="rv-energy" style="color:var(--green-glow)">--</span></span>
+          <span>精炼： <span id="rv-refine" style="color:var(--cyan)">--</span></span>
+          <span>姿态影响： <span id="rv-impact" style="color:var(--amber)">--</span></span>
+        </div>
+      </div>
+
+      <!-- Latency -->
+      <div class="panel">
+        <div class="panel-title">&#9670; 流水线延迟</div>
+        <div class="latency-grid">
+          <div class="latency-item">
+            <div class="latency-value" id="lat-video">--</div>
+            <div class="latency-label">视频 CNN</div>
+          </div>
+          <div class="latency-item">
+            <div class="latency-value" id="lat-csi">--</div>
+            <div class="latency-label">CSI CNN</div>
+          </div>
+          <div class="latency-item">
+            <div class="latency-value" id="lat-fusion">--</div>
+            <div class="latency-label">融合</div>
+          </div>
+          <div class="latency-item">
+            <div class="latency-value" id="lat-total">--</div>
+            <div class="latency-label">总计</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 控制 -->
+      <div class="panel">
+        <div class="panel-title">&#9670; 控制</div>
+        <div class="controls-row">
+          <button class="btn" id="pause-btn">⏸ 暂停</button>
+        </div>
+
+        <div class="slider-row">
+          <label>置信度</label>
+          <input type="range" id="confidence-slider" min="0" max="1" step="0.05" value="0.3">
+          <span class="slider-val" id="confidence-value">0.30</span>
+        </div>
+
+        <div style="margin-top:10px">
+          <div class="panel-title" style="margin-bottom:6px">&#9670; 实时 CSI 源</div>
+          <div style="display:flex;gap:6px">
+            <input type="text" id="ws-url" placeholder="ws://localhost:3030/ws/csi"
+              style="flex:1;background:rgba(255,255,255,0.05);border:1px solid var(--bg-panel-border);
+                     color:var(--text-primary);padding:5px 8px;border-radius:4px;font-size:11px;
+                     font-family:'JetBrains Mono',monospace">
+            <button class="btn" id="connect-ws-btn">连接</button>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /side-panels -->
+
+    <!-- Bottom Bar -->
+    <div class="bottom-bar">
+      <div>
+        RuView &middot; 双模态姿态估计 &middot;
+        架构：Conv2D &rarr; RuVector 六级注意力（Flash+MHA+双曲+线性+MoE+L/G） &rarr; 融合 &rarr; 26 关键点姿态
+      </div>
+      <div>
+        <a href="https://github.com/ruvnet/RuView">GitHub</a> &middot;
+        CNN: <span id="cnn-backend">ruvector-cnn（加载中…）</span> &middot;
+        <a href="observatory.html">观测站</a>
+      </div>
+    </div>
+
+  </div><!-- /main-grid -->
+
+  <footer class="ns-footer ns-footer--fixed">© 2026 Nicesemi 拟世</footer>
+
+  <script type="module" src="pose-fusion/js/main.js?v=14"></script>
+</body>
+</html>

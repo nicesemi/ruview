@@ -1,0 +1,11 @@
+.git/
+.github/
+*.log
+__pycache__/
+*.pyc
+.env
+node_modules/
+.claude/
+ui/_backup*
+archive/v1/data/
+archive/v1/tests/

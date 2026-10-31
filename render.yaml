@@ -1,13 +1,14 @@
 # Render Blueprint — π RuView
 #
-# Deploy: push this repo to GitHub, then Render Dashboard → New → Blueprint →
-# pick the repo. Render reads this file and creates the free web service.
+# Deploy: https://render.com/deploy?repo=https://github.com/nicesemi/ruview
+# Render reads this file, builds docker/Dockerfile.cloud and creates one free
+# web service.
 #
 # Free-tier reality check (Render Hobby, 2026):
-#   * 512 MB RAM / 0.1 CPU  — enough for the simulated sensing pipeline
+#   * 512 MB RAM / 0.1 CPU — enough for the simulated sensing pipeline
 #   * 750 instance-hours per workspace per month
 #   * sleeps after 15 min without inbound traffic, ~1 min cold start
-#   * WebSocket traffic counts as activity (so an open UI keeps it awake)
+#   * WebSocket traffic counts as activity (an open UI keeps it awake)
 #   * custom domain + managed TLS included at no cost
 services:
   - type: web
@@ -20,14 +21,12 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
-      - key: PORT
-        value: 8080
+      # Render injects $PORT (10000) itself and routes 443 -> that port; the
+      # gateway reads os.environ["PORT"], so no override is needed here.
       - key: PYTHONUNBUFFERED
         value: "1"
-    # Render provisions the TLS certificate once DNS resolves here. In Alibaba
-    # Cloud DNS (dns25/dns26.hichina.com) add:
-    #   CNAME  www   -> <service>.onrender.com
-    #   ALIAS/A ruview.tech -> Render 控制台给出的目标（apex 用 A 记录）
-    domains:
-      - ruview.tech
-      - www.ruview.tech
+# Custom domains are added after the first successful deploy
+# (Service → Settings → Custom Domains), because the apex record has to be
+# verified in Alibaba Cloud DNS first:
+#   CNAME  www          -> <service>.onrender.com
+#   A      @            -> Render 控制台给出的 IP

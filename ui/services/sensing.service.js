@@ -36,6 +36,10 @@ const MAX_RECONNECT_ATTEMPTS = 20;
 // This prevents the UI from flashing "SIMULATED" on a brief hiccup.
 const SIM_FALLBACK_AFTER_ATTEMPTS = 5;
 const SIMULATION_INTERVAL = 500; // ms
+// How long without a sensing frame before the UI stops calling the link
+// "live". The gateway marks a frame stale after 5 s; allow two missed
+// stalls on top of that so a single dropped UDP packet is not an outage.
+const STALE_FRAME_MS = 15000;
 
 export const SIM_FALLBACK_STORAGE_KEY = 'ruview-client-simulation';
 
@@ -262,6 +266,7 @@ export class SensingService {
       // Don't assume "live" yet — wait for first frame's source field.
       // Fetch server status to determine actual data source immediately.
       this._detectServerSource();
+      this._startFreshnessWatch();
     };
 
     ws.onmessage = (evt) => {
@@ -287,6 +292,7 @@ export class SensingService {
       }
       console.info('[Sensing] Connection closed (code=%d)', evt.code);
       this._ws = null;
+      this._stopFreshnessWatch();
       if (evt.code !== 1000 && !opened && !ticketed) {
         // #2099: a refused upgrade looks like any other failure from here, so
         // ask the server whether it wants a token before retrying forever.
@@ -538,6 +544,25 @@ export class SensingService {
   _handleData(data) {
     this._lastMessage = data;
 
+    // ADR-295 runtime demotion. When the hardware disappears the gateway stops
+    // emitting frames and instead broadcasts its canonical state; without this
+    // the banner would keep advertising "ESP32 connected" forever, because the
+    // data-source label is otherwise only ever written by `_detectServerSource`
+    // on socket open or by a *new* frame's `source` field.
+    if (data.type === 'source_state') {
+      this._lastFrameAt = 0;
+      this._applyServerSource(data.source, data.source_state);
+      return;
+    }
+    if (data.type === 'system_event' && /idle/i.test(String(data.data?.message || ''))) {
+      this._lastFrameAt = 0;
+      this._applyServerSource(null, 'disconnected');
+      return;
+    }
+    if (data.type === 'sensing_update') {
+      this._lastFrameAt = Date.now();
+    }
+
     // Track the server's source field from each frame so the UI
     // can react if the server switches between esp32 ↔ simulated at runtime.
     if (data.source && this._state === 'connected') {
@@ -579,6 +604,30 @@ export class SensingService {
     }
   }
 
+  /**
+   * Watchdog for silent hardware loss: if the socket stays open but no frame
+   * arrives, demote the label instead of waiting for a message that will never
+   * come (an unplugged ESP32 produces silence, not a close event).
+   */
+  _startFreshnessWatch() {
+    if (this._freshnessTimer) return;
+    this._lastFrameAt = Date.now();
+    this._freshnessTimer = setInterval(() => {
+      if (this._state !== 'connected') return;
+      if (this._dataSource !== 'live') return;
+      if (this._lastFrameAt && Date.now() - this._lastFrameAt < STALE_FRAME_MS) return;
+      console.info('[Sensing] No sensing frames for %dms — demoting from live', STALE_FRAME_MS);
+      this._applyServerSource(null, 'disconnected');
+    }, 3000);
+  }
+
+  _stopFreshnessWatch() {
+    if (this._freshnessTimer) {
+      clearInterval(this._freshnessTimer);
+      this._freshnessTimer = null;
+    }
+  }
+
   // ---- State management --------------------------------------------------
 
   _setState(newState) {
@@ -605,6 +654,7 @@ export class SensingService {
   }
 
   _clearTimers() {
+    this._stopFreshnessWatch();
     this._stopSimulation();
     if (this._reconnectTimer) {
       clearTimeout(this._reconnectTimer);

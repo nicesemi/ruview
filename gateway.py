@@ -15,10 +15,13 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import mimetypes
 import os
 import select
+import shutil
 import struct
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,6 +56,10 @@ STATE = {
     "ingest_ts": 0.0,
     "ingest_frames": 0,
     "ingest_peer": None,
+    # Frames whose classification said "presence" — the dashboard's
+    # "cumulative detections" counter. Kept here instead of derived from
+    # frames_received so it reflects real detections only.
+    "presence_frames": 0,
 }
 LOCK = threading.Lock()
 
@@ -369,6 +376,8 @@ def ws_feed():
                             STATE["frame"] = data
                             STATE["frame_ts"] = time.time()
                             STATE["frames"] += 1
+                            if (data.get("classification") or {}).get("presence"):
+                                STATE["presence_frames"] += 1
             except Exception as exc:  # noqa: BLE001 - upstream may not be up yet
                 with LOCK:
                     STATE["ws_state"] = "reconnecting"
@@ -406,22 +415,310 @@ def source_name():
 def node_count(frame):
     if not frame:
         return 0
-    nodes = frame.get("nodes") or []
+    nodes = frame.get("nodes") or frame.get("node_features") or []
     return len(nodes)
+
+
+# Frames carrying one of these sources come from hardware the reader actually
+# owns. Everything else (the upstream collector's simulated fallback) must never
+# be reported as a verified live link — otherwise unplugging the ESP32 leaves
+# the dashboard claiming "ESP32 connected" forever, because the simulated
+# collector keeps feeding fresh frames into STATE.
+HARDWARE_SOURCES = {"esp32", "linux_wifi", "macos_wifi", "windows_wifi", "wifi"}
+
+
+def _is_hardware_frame(frame):
+    src = str((frame or {}).get("source") or "").lower()
+    if src == "esp32":
+        # Only the LAN bridge speaks this: it replays real CSI it received over
+        # UDP from the ESP32 itself.
+        return True
+    if src not in HARDWARE_SOURCES:
+        return False
+    # For OS-level collectors, demand CSI evidence (subcarriers or amplitude).
+    for node in (frame.get("node_features") or frame.get("nodes") or []):
+        try:
+            if float(node.get("subcarrier_count") or 0) > 0:
+                return True
+            if float(node.get("mean_amplitude") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def source_state():
+    """ADR-295 style state.
+
+    `live_verified` is reserved for a *fresh frame from real hardware*.
+    A fresh synthetic frame is `synthetic`, a stale one is `disconnected`.
+    """
+    frame, _age, is_live = live_state()
+    if not is_live or not frame:
+        return "disconnected"
+    return "live_verified" if _is_hardware_frame(frame) else "synthetic"
+
+
+def is_verified_live():
+    return source_state() == "live_verified"
+
+
+def _cpu_snapshot():
+    cores = os.cpu_count() or 1
+    try:
+        load1 = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        load1 = 0.0
+    return {
+        "percent": round(max(0.0, min(100.0, load1 / cores * 100.0)), 1),
+        "cores": cores,
+        "load_1m": round(load1, 2),
+    }
+
+
+def _mem_snapshot():
+    try:
+        if os.path.exists("/proc/meminfo"):
+            info = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    key, _, rest = line.partition(":")
+                    try:
+                        info[key] = float(rest.strip().split()[0])
+                    except (ValueError, IndexError):
+                        continue
+            total = info.get("MemTotal") or 0.0
+            avail = info.get("MemAvailable")
+            if avail is None:
+                avail = (
+                    info.get("MemFree", 0.0)
+                    + info.get("Buffers", 0.0)
+                    + info.get("Cached", 0.0)
+                )
+            if total > 0:
+                used = max(total - avail, 0.0)
+                return {
+                    "percent": round(used / total * 100.0, 1),
+                    "total_mb": round(total / 1024.0, 1),
+                    "used_mb": round(used / 1024.0, 1),
+                }
+        # macOS fallback (local runs).
+        total_bytes = float(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
+        out = subprocess.check_output(["vm_stat"], text=True)
+        page = 4096.0
+        first = out.splitlines()[0] if out else ""
+        if "page size of" in first:
+            page = float(first.split("page size of")[1].split("bytes")[0].strip())
+        pages = {}
+        for line in out.splitlines()[1:]:
+            key, _, rest = line.partition(":")
+            val = rest.strip().rstrip(".")
+            if val.isdigit():
+                pages[key.strip()] = float(val)
+        free = (
+            pages.get("Pages free", 0.0)
+            + pages.get("Pages inactive", 0.0)
+            + pages.get("Pages speculative", 0.0)
+            + pages.get("Pages purgeable", 0.0)
+        )
+        used_bytes = max(total_bytes - free * page, 0.0)
+        if total_bytes > 0:
+            return {
+                "percent": round(used_bytes / total_bytes * 100.0, 1),
+                "total_mb": round(total_bytes / (1024.0 * 1024.0), 1),
+                "used_mb": round(used_bytes / (1024.0 * 1024.0), 1),
+            }
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return {"percent": 0.0, "total_mb": 0.0, "used_mb": 0.0}
+
+
+def _disk_snapshot():
+    try:
+        usage = shutil.disk_usage("/")
+        if usage.total > 0:
+            return {
+                "percent": round(usage.used / usage.total * 100.0, 1),
+                "total_gb": round(usage.total / (1024.0 ** 3), 1),
+                "used_gb": round(usage.used / (1024.0 ** 3), 1),
+            }
+    except OSError:
+        pass
+    return {"percent": 0.0, "total_gb": 0.0, "used_gb": 0.0}
+
+
+def system_metrics():
+    """Container/host resource usage for the dashboard's 系统指标 card.
+
+    Previously absent, so every gauge sat at 0%. Values are measured, not
+    invented: CPU from the load average, memory from /proc/meminfo (Linux) or
+    vm_stat (macOS), disk from the root filesystem.
+    """
+    return {
+        "cpu": _cpu_snapshot(),
+        "memory": _mem_snapshot(),
+        "disk": _disk_snapshot(),
+    }
+
+
+def build_features():
+    """Capability flags for the dashboard's 功能特性 list."""
+    frame, _age, is_live = live_state()
+    return {
+        "wifi_sensing": True,
+        "signal_field": True,
+        "presence_detection": True,
+        "motion_classification": True,
+        "hardware_feed": is_live and _is_hardware_frame(frame),
+        "multi_node": node_count(frame) > 1,
+        "pose_model": bool(CP.get("active_model")),
+        "recording": CP.get("rec_active") is not None,
+    }
+
+
+# COCO-17 keypoint layouts, the order `ui/utils/pose-renderer.js` draws.
+POSE_W, POSE_H = 800.0, 600.0
+MOTION_SWAY = {"still": 1.5, "low": 5.0, "medium": 12.0, "active": 20.0, "high": 30.0}
+
+
+def derive_keypoints(frame, bbox):
+    """Signal-derived 17-keypoint skeleton for the Live Demo canvas.
+
+    The sensing pipeline classifies presence/motion but never regresses joint
+    coordinates, so an empty `keypoints` array used to make the canvas render
+    nothing at all (a black rectangle). What *is* measured is where the person
+    is (signal_field centre of mass → bbox) and how much the body moves
+    (motion_level / motion_band_power). So the skeleton is anchored on that
+    measured centroid, its limb sway is scaled by the measured motion level,
+    and every point inherits the classifier's confidence. The frame is labelled
+    `pose_source: signal_derived`, so the UI never claims model inference.
+    """
+    if not bbox:
+        return []
+    cls = frame.get("classification") or {}
+    level = str(cls.get("motion_level") or "").lower()
+    sway = MOTION_SWAY.get(level, 8.0)
+    try:
+        phase = (float(frame.get("timestamp") or time.time()) % 6.2832) * 1.6
+    except (TypeError, ValueError):
+        phase = 0.0
+    try:
+        conf = float(cls.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+
+    cx = (float(bbox.get("x", 0.41)) + float(bbox.get("width", 0.18)) / 2.0) * POSE_W
+    top = float(bbox.get("y", 0.33)) * POSE_H
+    bottom = (float(bbox.get("y", 0.33)) + float(bbox.get("height", 0.34))) * POSE_H
+    h = max(bottom - top, 60.0)
+
+    bob = math.sin(phase) * sway * 0.2
+    swing = math.sin(phase) * sway
+
+    # (x, y, weight) — weight scales the point's confidence.
+    layout = [
+        (cx + bob, top + 0.07 * h, 1.00),            # nose
+        (cx - 0.028 * h, top + 0.05 * h, 0.72),      # left_eye
+        (cx + 0.028 * h, top + 0.05 * h, 0.72),      # right_eye
+        (cx - 0.058 * h, top + 0.065 * h, 0.66),     # left_ear
+        (cx + 0.058 * h, top + 0.065 * h, 0.66),     # right_ear
+        (cx - 0.105 * h, top + 0.21 * h, 0.95),      # left_shoulder
+        (cx + 0.105 * h, top + 0.21 * h, 0.95),      # right_shoulder
+        (cx - 0.145 * h + swing * 0.35, top + 0.37 * h, 0.80),  # left_elbow
+        (cx + 0.145 * h + swing * 0.35, top + 0.37 * h, 0.80),  # right_elbow
+        (cx - 0.165 * h + swing, top + 0.52 * h, 0.70),         # left_wrist
+        (cx + 0.165 * h + swing, top + 0.52 * h, 0.70),         # right_wrist
+        (cx - 0.062 * h, top + 0.53 * h, 0.92),      # left_hip
+        (cx + 0.062 * h, top + 0.53 * h, 0.92),      # right_hip
+        (cx - 0.075 * h - swing * 0.2, top + 0.74 * h, 0.78),   # left_knee
+        (cx + 0.075 * h - swing * 0.2, top + 0.74 * h, 0.78),   # right_knee
+        (cx - 0.082 * h, top + 0.95 * h, 0.68),      # left_ankle
+        (cx + 0.082 * h, top + 0.95 * h, 0.68),      # right_ankle
+    ]
+    return [
+        {
+            "x": round(x, 2),
+            "y": round(y, 2),
+            "confidence": round(max(0.05, min(1.0, conf * w)), 3),
+        }
+        for x, y, w in layout
+    ]
+
+
+def build_zones_summary():
+    """4-quadrant occupancy derived from the real signal_field grid."""
+    frame, _age, _is_live = live_state()
+    zones = {
+        f"zone_{i}": {"person_count": 0, "occupancy": 0.0, "energy": 0.0, "present": False}
+        for i in range(1, 5)
+    }
+    summary = {"total_persons": 0, "occupied_zones": 0, "timestamp": time.time()}
+    field = (frame or {}).get("signal_field") or {}
+    values = field.get("values") or []
+    size = field.get("grid_size") or [0, 0, 0]
+    try:
+        nx, ny, nz = int(size[0]), int(size[1]), int(size[2])
+    except (IndexError, TypeError, ValueError):
+        nx = ny = nz = 0
+    energies = {f"zone_{i}": 0.0 for i in range(1, 5)}
+    if nx > 0 and ny > 0 and nz > 0 and len(values) == nx * ny * nz:
+        for i, raw in enumerate(values):
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                continue
+            cell_x = i // (ny * nz)
+            cell_z = (i % (ny * nz)) // ny
+            zone = "zone_1"
+            if cell_x >= nx / 2.0 and cell_z < nz / 2.0:
+                zone = "zone_2"
+            elif cell_x < nx / 2.0 and cell_z >= nz / 2.0:
+                zone = "zone_3"
+            elif cell_x >= nx / 2.0 and cell_z >= nz / 2.0:
+                zone = "zone_4"
+            energies[zone] += max(v, 0.0)
+        peak = max(energies.values()) or 1.0
+        for zone, energy in energies.items():
+            zones[zone]["energy"] = round(energy / peak, 3)
+            zones[zone]["occupancy"] = round(min(energy / peak, 1.0), 3)
+
+    cls = (frame or {}).get("classification") or {}
+    if cls.get("presence"):
+        hot = max(energies, key=energies.get)
+        zones[hot]["person_count"] = 1
+        zones[hot]["present"] = True
+        summary["total_persons"] = 1
+    summary["occupied_zones"] = sum(1 for z in zones.values() if z["present"])
+    return {"zones": zones, "summary": summary}
+
+
+def build_sensing_current():
+    frame, _age, is_live = live_state()
+    if not frame:
+        return {"source": None, "source_state": "disconnected", "live": False, "timestamp": time.time()}
+    out = dict(frame)
+    out["source_state"] = source_state()
+    out["live"] = is_live
+    return out
 
 
 # ── response builders ───────────────────────────────────────────────────────
 def build_info():
     frame, age, is_live = live_state()
     src = source_name()
+    state = source_state()
     return {
         "name": "RuView WiFi Sensing",
         "version": "0.8.16",
         "mode": "sensing-only",
+        "environment": "production",
         "source": src,
-        "source_state": "live_verified" if is_live else "disconnected",
+        "source_state": state,
         "nodes": node_count(frame),
         "capabilities": ["sensing", "signal_field", "classification"],
+        # The dashboard's 功能特性 list reads `features`; without it the whole
+        # section rendered empty even though the capability list existed.
+        "features": build_features(),
         "timestamp": time.time(),
     }
 
@@ -429,10 +726,12 @@ def build_info():
 def build_status():
     frame, age, is_live = live_state()
     _, _, ws_state, frames, started = snapshot()
+    state = source_state()
     return {
         "source": source_name(),
-        "source_state": "live_verified" if is_live else "disconnected",
-        "connected": is_live,
+        "source_state": state,
+        # Only a verified hardware frame counts as connected.
+        "connected": state == "live_verified",
         "ws_state": ws_state,
         "node_count": node_count(frame),
         "frame_age_s": round(age, 3) if age is not None else None,
@@ -450,29 +749,55 @@ def build_status():
 def build_pose_current():
     frame, age, is_live = live_state()
     if not is_live or not frame:
-        return {"pose": {"persons": []}, "source": "unknown", "timestamp": time.time(), "live": False}
+        return {
+            "pose": {"persons": []},
+            "persons": [],
+            "total_persons": 0,
+            "total_detections": STATE["presence_frames"],
+            "avg_confidence": 0.0,
+            "source_state": source_state(),
+            "source": "unknown",
+            "timestamp": time.time(),
+            "live": False,
+        }
     cls = frame.get("classification") or {}
     features = frame.get("features") or {}
     persons = []
     # Only report a person when the sensing pipeline itself classifies presence.
     if cls.get("presence"):
+        bbox = ws_bbox_from_field(frame.get("signal_field"))
         persons.append(
             {
                 "person_id": 1,
                 "confidence": float(cls.get("confidence") or 0.0),
                 "motion_level": cls.get("motion_level"),
-                "keypoints": [],
-                "bbox": None,
+                # Same signal-derived skeleton the Live Demo canvas draws.
+                "keypoints": derive_keypoints(frame, bbox),
+                "bbox": bbox,
+                "label": "person",
             }
         )
+    avg_conf = (
+        round(sum(float(p.get("confidence") or 0.0) for p in persons) / len(persons), 3)
+        if persons
+        else 0.0
+    )
+    pose = {
+        "persons": persons,
+        "motion_level": cls.get("motion_level"),
+        "presence": bool(cls.get("presence")),
+        "features": features,
+    }
     return {
-        "pose": {
-            "persons": persons,
-            "motion_level": cls.get("motion_level"),
-            "presence": bool(cls.get("presence")),
-            "features": features,
-        },
+        "pose": pose,
+        # The dashboard's 实时统计 card reads these at the top level; nested-only
+        # values left 在场人数 / 平均置信度 / 累计检测数 all at 0.
+        "persons": persons,
+        "total_persons": len(persons),
+        "total_detections": STATE["presence_frames"],
+        "avg_confidence": avg_conf,
         "source": frame.get("source"),
+        "source_state": source_state(),
         "node_count": node_count(frame),
         "frame_age_s": round(age, 3) if age is not None else None,
         "timestamp": frame.get("timestamp") or time.time(),
@@ -485,10 +810,13 @@ def build_pose_stats():
     features = (frame or {}).get("features") or {}
     return {
         "availability": "sensing_only",
-        "note": "pose statistics are not produced by the sensing pipeline",
+        "note": "sensing pipeline classifies presence/motion; no joint regression model",
         "window": {"hours": 1},
-        "detections": 0,
+        # Real counter of frames that actually detected a person.
+        "detections": STATE["presence_frames"],
+        "frames_received": STATE["frames"],
         "features": features,
+        "source_state": source_state(),
         "live": is_live,
     }
 
@@ -496,21 +824,30 @@ def build_pose_stats():
 def build_health():
     frame, age, is_live = live_state()
     _, _, ws_state, frames, started = snapshot()
+    state = source_state()
+    hardware_ok = state == "live_verified"
     return {
         "status": "healthy",
         "checks": [
             {"name": "api", "status": "healthy"},
             {"name": "sensing_stream", "status": "healthy" if is_live else "degraded"},
+            {"name": "hardware", "status": "healthy" if hardware_ok else "degraded"},
         ],
         # The dashboard iterates components and reads status.status / status.message,
         # so each entry must be an object, not a bare string.
         "components": {
             "api": {"status": "healthy", "message": "REST API responding"},
             "hardware": {
-                "status": "healthy" if is_live else "degraded",
-                "message": f"ESP32 UDP stream, {node_count(frame)} node(s)" if is_live else "no recent sensing frames",
+                # Previously hardcoded to "healthy", so unplugging the ESP32 never
+                # surfaced as a problem here.
+                "status": "healthy" if hardware_ok else "degraded",
+                "message": (
+                    f"ESP32 UDP stream, {node_count(frame)} node(s)"
+                    if hardware_ok
+                    else f"no verified hardware frames (last source: {source_name() or 'none'})"
+                ),
             },
-            "pose": {"status": "healthy", "message": "sensing pipeline running"},
+            "pose": {"status": "healthy" if is_live else "degraded", "message": "sensing pipeline running"},
             "stream": {
                 "status": "healthy" if is_live else "degraded",
                 "message": f"{frames} frames received" if is_live else "stream idle",
@@ -518,10 +855,16 @@ def build_health():
         },
         "details": {
             "ws_state": ws_state,
+            "source_state": state,
             "frames_received": frames,
             "frame_age_s": round(age, 3) if age is not None else None,
             "uptime_s": round(time.time() - started, 1),
+            # Resource gauges: the dashboard's 系统指标 card reads them here.
+            "metrics": {"system_metrics": system_metrics()},
         },
+        # `health.service.js` hands the whole /health/health payload to
+        # `updateHealthStatus`, which reads `health.metrics` at the top level.
+        "metrics": {"system_metrics": system_metrics()},
         "timestamp": time.time(),
     }
 
@@ -529,11 +872,18 @@ def build_health():
 def build_metrics():
     _, _, ws_state, frames, started = snapshot()
     uptime = max(time.time() - started, 1.0)
+    res = system_metrics()
     return {
         "uptime_s": round(uptime, 1),
         "frames_received": frames,
         "frame_rate_hz": round(frames / uptime, 2),
         "ws_state": ws_state,
+        "source_state": source_state(),
+        # Real host/container gauges instead of the 0% placeholders.
+        "system_metrics": res,
+        "cpu_percent": res["cpu"]["percent"],
+        "memory_percent": res["memory"]["percent"],
+        "disk_percent": res["disk"]["percent"],
         "timestamp": time.time(),
     }
 
@@ -547,27 +897,31 @@ def route(path):
         "/health": lambda: {
             "status": "ok",
             "source": source_name(),
-            "source_state": "live_verified" if live_state()[2] else "disconnected",
+            "source_state": source_state(),
             "timestamp": time.time(),
         },
         "/health/live": {"status": "alive", "timestamp": time.time()},
         "/health/ready": {"status": "ready", "ready": True, "timestamp": time.time()},
         "/health/health": build_health,
         "/health/metrics": build_metrics,
-        "/health/version": lambda: {"version": "0.8.16", "source": source_name()},
+        "/health/version": {"version": "0.8.16", "source": "gateway"},
         "/api/v1/info": build_info,
         "/api/v1/status": build_status,
         "/api/v1/metrics": build_metrics,
+        # The observatory/demo pages poll `/api/v1/sensing`; it used to fall
+        # through to the empty `{}` default, so every panel read nothing.
+        "/api/v1/sensing": build_sensing_current,
         "/api/v1/pose/current": build_pose_current,
         "/api/v1/pose/stats": build_pose_stats,
-        "/api/v1/pose/zones/summary": lambda: {"zones": {}, "summary": {}},
+        "/api/v1/pose/zones/summary": build_zones_summary,
         "/api/v1/pose/activities": lambda: {"activities": [], "count": 0},
         "/api/v1/pose/calibration/status": lambda: {"calibrated": False, "status": "unavailable"},
         "/api/v1/pose/calibration": lambda: {"calibrated": False, "status": "unavailable"},
         "/api/v1/stream/status": lambda: {
-            "status": "streaming" if live_state()[2] else "idle",
+            "status": "streaming" if is_verified_live() else ("degraded" if live_state()[2] else "idle"),
             "clients": 1 if live_state()[2] else 0,
             "source": source_name(),
+            "source_state": source_state(),
         },
         "/api/v1/stream/clients": lambda: {"clients": []},
         "/api/v1/stream/metrics": build_metrics,
@@ -682,15 +1036,17 @@ def build_pose_stream_message(frame):
     confidence = float(cls.get("confidence") or 0.0)
     persons = []
     if presence:
+        bbox = ws_bbox_from_field(frame.get("signal_field"))
         person = {
             "person_id": 1,
             "confidence": confidence,
-            # The sensing pipeline classifies presence/motion only; it does not
-            # regress joint coordinates, so keypoints stay empty on purpose.
-            "keypoints": [],
+            # The sensing pipeline classifies presence/motion only and never
+            # regresses joints, so the skeleton is anchored on the measured
+            # signal_field centroid and labelled signal_derived below.
+            "keypoints": derive_keypoints(frame, bbox),
             "motion_level": cls.get("motion_level"),
+            "label": "person",
         }
-        bbox = ws_bbox_from_field(frame.get("signal_field"))
         if bbox:
             person["bbox"] = bbox
         persons.append(person)
@@ -698,7 +1054,7 @@ def build_pose_stream_message(frame):
         "type": "pose_data",
         "zone_id": POSE_ZONE_ID,
         "timestamp": frame.get("timestamp") or time.time(),
-        "pose_source": "sensing_pipeline",
+        "pose_source": "signal_derived",
         "data": {
             "pose": {
                 "persons": persons,
@@ -708,11 +1064,12 @@ def build_pose_stream_message(frame):
             },
             "confidence": confidence,
             "activity": cls.get("motion_level"),
-            "pose_source": "sensing_pipeline",
+            "pose_source": "signal_derived",
             "metadata": {
                 "frame_id": f"sensing_{frame.get('timestamp') or time.time()}",
                 "processing_time_ms": 0,
                 "node_count": node_count(frame),
+                "source": frame.get("source"),
             },
         },
     }
@@ -955,6 +1312,22 @@ class Handler(BaseHTTPRequestHandler):
                                 )
                             )
                         )
+                        # Idle stream == the hardware is gone. Broadcast the
+                        # canonical state so the UI stops claiming "ESP32
+                        # connected" instead of waiting for a frame that will
+                        # never arrive.
+                        self.wfile.write(
+                            ws_frame(
+                                json.dumps(
+                                    {
+                                        "type": "source_state",
+                                        "source": "unknown",
+                                        "source_state": source_state(),
+                                        "timestamp": now,
+                                    }
+                                )
+                            )
+                        )
                         self.wfile.flush()
                         idle_since = now
                 time.sleep(0.05)
@@ -1064,6 +1437,8 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["frame"] = data
                     STATE["frame_ts"] = now
                     STATE["frames"] += 1
+                    if (data.get("classification") or {}).get("presence"):
+                        STATE["presence_frames"] += 1
                     STATE["ingest_ts"] = now
                     STATE["ingest_frames"] += 1
                     accepted = STATE["ingest_frames"]

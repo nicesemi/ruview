@@ -12,7 +12,7 @@ Usage
     python -m v1.src.sensing.ws_server          # or  python v1/src/sensing/ws_server.py
 
 Data sources (tried in order):
-    1. ESP32 CSI over UDP port 5005 (ADR-018 binary frames)
+    1. ESP32 CSI over UDP port 5006 (ADR-018 binary frames)
     2. Windows WiFi RSSI via netsh
     3. Linux WiFi RSSI via /proc/net/wireless
     4. Simulated collector (fallback)
@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import dataclasses
 import logging
 import math
+import os
 import signal
 import socket
 import struct
@@ -42,6 +44,7 @@ from v1.src.sensing.rssi_collector import (
 )
 from v1.src.sensing.feature_extractor import RssiFeatureExtractor, RssiFeatures
 from v1.src.sensing.classifier import MotionLevel, PresenceClassifier, SensingResult
+from v1.src.sensing import presence_v2
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +54,33 @@ logger = logging.getLogger(__name__)
 
 HOST = "0.0.0.0"
 PORT = 8765
-TICK_INTERVAL = 0.5  # seconds between broadcasts
+TICK_INTERVAL = 0.1  # seconds between broadcasts (10 Hz observatory)
 SIGNAL_FIELD_GRID = 20  # NxN grid for signal field visualization
-ESP32_UDP_PORT = 5005
+ESP32_UDP_PORT = int(os.environ.get("RUVIEW_UDP_PORT") or 5006)
+PRESENCE_HOLD_S = float(os.environ.get("RUVIEW_PRESENCE_HOLD_S") or 45.0)
+# How often the 60 s presence_v2 window is re-evaluated. Kept at 1 Hz so the
+# ingest thread is not starved by back-to-back FFTs on every 100 ms tick.
+V2_RECOMPUTE_S = float(os.environ.get("RUVIEW_V2_RECOMPUTE_S") or 1.0)
+# Host bridge -> container fallback: Docker Desktop on macOS drops host-originated
+# UDP, so the bridge also serves raw frames over outbound TCP.
+TCP_FEED = os.environ.get("RUVIEW_TCP_FEED") or "host.docker.internal:5099"
 
 
 # ---------------------------------------------------------------------------
 # ESP32 UDP Collector — reads ADR-018 binary frames
 # ---------------------------------------------------------------------------
+
+def _tcp_feed_reachable(spec: str, timeout: float = 0.6) -> bool:
+    """True when a host:port TCP endpoint accepts a connection."""
+    host, _, port = (spec or "").rpartition(":")
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
 
 class Esp32UdpCollector:
     """
@@ -94,6 +116,10 @@ class Esp32UdpCollector:
         # Last CSI frame for enhanced UI
         self.last_csi: Optional[Dict] = None
         self._frames_received = 0
+        # Per-subcarrier amplitude history (60 s) for presence_v2: the stock
+        # extractor only keeps a scalar mean amplitude per frame, which is
+        # exactly the quantity the AGC gain step corrupts.
+        self.sc_hist: deque = deque(maxlen=int(max(sample_rate_hz, 30.0) * 120))
 
     @property
     def sample_rate_hz(self) -> float:
@@ -159,17 +185,32 @@ class Esp32UdpCollector:
         # Parse I/Q data if available
         iq_count = n_ant * n_sc
         iq_bytes_needed = self.HEADER_SIZE + iq_count * 2
-        amplitude_list = []
+        amp_arr = None
 
         if len(raw) >= iq_bytes_needed and iq_count > 0:
-            iq_raw = struct.unpack_from(f'<{iq_count * 2}b', raw, self.HEADER_SIZE)
-            i_vals = np.array(iq_raw[0::2], dtype=np.float64)
-            q_vals = np.array(iq_raw[1::2], dtype=np.float64)
-            amplitudes = np.sqrt(i_vals ** 2 + q_vals ** 2)
-            mean_amp = float(np.mean(amplitudes))
-            amplitude_list = amplitudes.tolist()
+            # Vectorised on purpose: unpacking 612 ints one by one through
+            # struct.unpack() costs ~300 us/frame and caps ingest at ~8 fps,
+            # which silently drops 2 of every 3 burst frames.
+            iq = np.frombuffer(raw, dtype=np.int8, count=iq_count * 2,
+                               offset=self.HEADER_SIZE).astype(np.float32)
+            i_vals = iq[0::2]
+            q_vals = iq[1::2]
+            amp_arr = np.sqrt(i_vals * i_vals + q_vals * q_vals)
+            mean_amp = float(amp_arr.mean())
         else:
             mean_amp = 0.0
+
+        if amp_arr is not None and amp_arr.size:
+            # Keep the raw I/Q, not just the amplitude: presence on this hardware
+            # is carried by the phase difference across subcarriers, and folding
+            # it into sqrt(i^2+q^2) throws that away -- an empty room then reads
+            # a *higher* breathing share than a seated person does.
+            try:
+                iq_pairs = iq.reshape(n_ant, n_sc, 2)[0]
+            except Exception:
+                iq_pairs = None
+            self.sc_hist.append((time.time(), int(n_sc),
+                                 iq_pairs if iq_pairs is not None else amp_arr))
 
         # Store enhanced CSI info for UI
         self.last_csi = {
@@ -181,7 +222,7 @@ class Esp32UdpCollector:
             "rssi_dbm": rssi,
             "noise_floor_dbm": noise,
             "mean_amplitude": mean_amp,
-            "amplitude": amplitude_list[:56],  # cap for JSON size
+            "amplitude": amp_arr[:56].tolist() if amp_arr is not None else [],  # cap for JSON size
             "source_addr": f"{addr[0]}:{addr[1]}",
         }
 
@@ -312,6 +353,10 @@ class SensingWebSocketServer:
         self.collector = None
         self.extractor = RssiFeatureExtractor(window_seconds=10.0)
         self.classifier = PresenceClassifier()
+        self._last_v2 = None
+        self._v2_ts = 0.0
+        self._smoother = presence_v2.PresenceSmoother(window=21)
+        self._presence_hold_until = 0.0
         self.source: str = "unknown"
         self._running = False
 
@@ -323,8 +368,15 @@ class SensingWebSocketServer:
         """
         from .rssi_collector import create_collector
 
+        # 0. Explicit TCP feed (docker cannot receive host UDP, so the bridge
+        #    pushes raw ADR-018 frames over outbound TCP instead)
+        if TCP_FEED and _tcp_feed_reachable(TCP_FEED):
+            logger.info("ESP32 collector fed over TCP: %s", TCP_FEED)
+            self.source = "esp32"
+            return Esp32UdpCollector(port=ESP32_UDP_PORT, sample_rate_hz=10.0)
+
         # 1. Try ESP32 UDP first
-        print("  Probing for ESP32 on UDP :5005 ...")
+        print(f"  Probing for ESP32 on UDP :{ESP32_UDP_PORT} ...")
         if probe_esp32_udp(ESP32_UDP_PORT, timeout=2.0):
             logger.info("ESP32 CSI stream detected on UDP :%d", ESP32_UDP_PORT)
             self.source = "esp32"
@@ -342,6 +394,126 @@ class SensingWebSocketServer:
         }
         self.source = source_map.get(type(collector).__name__, "unknown")
         return collector
+
+    def _start_tcp_feed(self) -> None:
+        """Pull raw CSI frames from the host bridge over TCP and feed them in.
+
+        Docker Desktop on macOS does not deliver host-originated UDP to a
+        container, but the container can open an outbound TCP connection, so
+        the bridge streams length-prefixed frames to whoever connects.
+        """
+        spec = TCP_FEED
+        if not spec or not _tcp_feed_reachable(spec):
+            return
+        host, _, port = spec.rpartition(":")
+        if not host:
+            host, port = spec, "5099"
+        try:
+            port_i = int(port)
+        except ValueError:
+            logger.error("bad RUVIEW_TCP_FEED: %s", spec)
+            return
+
+        collector = self.collector
+
+        def pump() -> None:
+            while self._running:
+                try:
+                    conn = socket.create_connection((host, port_i), timeout=5.0)
+                    conn.settimeout(5.0)
+                    logger.info("TCP CSI feed connected to %s:%d", host, port_i)
+                    buf = b""
+                    while self._running:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        while len(buf) >= 4:
+                            n = int.from_bytes(buf[:4], "big")
+                            if n <= 0 or n > 65535 or len(buf) < 4 + n:
+                                break
+                            frame, buf = buf[4:4 + n], buf[4 + n:]
+                            try:
+                                collector._parse_and_store(frame, ("tcp-feed", 0))
+                            except Exception:
+                                logger.exception("failed to ingest TCP CSI frame")
+                    conn.close()
+                except Exception:
+                    pass
+                time.sleep(2.0)
+
+        threading.Thread(target=pump, daemon=True, name="tcp-csi-feed").start()
+
+    def _apply_presence_v2(self, result: SensingResult) -> SensingResult:
+        """Override the wideband-variance presence verdict when real CSI exists.
+
+        The stock classifier keys presence off the variance of a scalar mean
+        amplitude, which on this hardware is dominated by AGC gain steps and
+        therefore reads "occupied" in an empty room. presence_v2 replaces it
+        with two calibrated paths (gain-normalised motion, breathing share).
+        """
+        collector = self.collector
+        hist = getattr(collector, "sc_hist", None)
+        if not hist:
+            self._last_v2 = None
+            return result
+        # Re-estimating a 60 s window ten times a second means two FFTs over a
+        # ~1800 x 306 matrix per 100 ms tick, which starves the TCP ingest
+        # thread down to ~8 fps and drops two of every three burst frames.
+        # The window is 60 s long, so 1 Hz is plenty.
+        now_v2 = time.time()
+        if self._last_v2 is not None and (now_v2 - self._v2_ts) < V2_RECOMPUTE_S:
+            v2 = self._last_v2
+        else:
+            try:
+                v2 = presence_v2.evaluate(list(hist))
+                if v2.window_s >= presence_v2.BREATH_MIN_S:
+                    v2 = self._smoother.push(v2)
+            except Exception:
+                logger.exception("presence_v2 evaluation failed")
+                self._last_v2 = None
+                return result
+            self._last_v2 = v2
+            self._v2_ts = now_v2
+        # Holding: a person does not vanish between two 60 s re-estimations, so
+        # keep presence asserted briefly after the last positive decision.
+        # NB: the held copy must never be written back to _last_v2 -- the cache
+        # is reused inside the 1 s throttle window, and feeding a held "present"
+        # back in renews the 45 s hold forever, so the room never goes absent.
+        if v2.presence:
+            self._presence_hold_until = now_v2 + PRESENCE_HOLD_S
+        elif now_v2 < self._presence_hold_until:
+            logger.debug("presence held for %.0fs more (raw absent)",
+                         self._presence_hold_until - now_v2)
+            v2 = dataclasses.replace(v2, presence=True)
+        if v2.presence and v2.motion_active:
+            level = MotionLevel.ACTIVE
+        elif v2.presence:
+            level = MotionLevel.PRESENT_STILL
+        else:
+            level = MotionLevel.ABSENT
+        _ratio = min(1.0, max(v2.phase_std / presence_v2.PHASE_STD_TH,
+                             v2.motion_score / presence_v2.MOTION_STD_TH))
+        # Confidence must express how sure we are of the reported verdict, not
+        # how far the metric sits above threshold: on an empty room the ratio is
+        # small and the label is ABSENT, so invert it there (otherwise "absent,
+        # 77%" reads as a confident person).
+        _conf = _ratio if v2.presence else (1.0 - _ratio)
+        return SensingResult(
+            motion_level=level,
+            confidence=round(0.6 + 0.4 * _conf, 3),
+            presence_detected=bool(v2.presence),
+            rssi_variance=result.rssi_variance,
+            motion_band_energy=result.motion_band_energy,
+            breathing_band_energy=result.breathing_band_energy,
+            n_change_points=result.n_change_points,
+            details=(
+                f"v2 presence={v2.presence} motion_score={v2.motion_score:.3f} "
+                f"(thresh={presence_v2.MOTION_STD_TH}) "
+                f"phase_std={v2.phase_std:.4f} (thresh={presence_v2.PHASE_STD_TH}) "
+                f"sc={v2.n_sc} frames={v2.n_frames} win={v2.window_s:.0f}s"
+            ),
+        )
 
     def _build_message(self, features: RssiFeatures, result: SensingResult) -> str:
         """Build the JSON message to broadcast."""
@@ -404,6 +576,8 @@ class SensingWebSocketServer:
                 "motion_level": result.motion_level.value,
                 "presence": result.presence_detected,
                 "confidence": round(result.confidence, 3),
+                "details": result.details,
+                "presence_evidence": (self._last_v2.as_dict() if self._last_v2 else None),
             },
             "signal_field": signal_field,
         }
@@ -445,18 +619,19 @@ class SensingWebSocketServer:
                 if len(samples) >= 4:
                     features = self.extractor.extract(samples)
                     result = self.classifier.classify(features)
+                    result = self._apply_presence_v2(result)
                     message = self._build_message(features, result)
                     await self._broadcast(message)
 
                     # Print status every few ticks
                     if isinstance(self.collector, Esp32UdpCollector):
                         csi = self.collector.last_csi
-                        if csi and self.collector.frames_received % 20 == 0:
+                        if csi and self.collector.frames_received % 40 == 0:
                             print(
                                 f"  [{csi['source_addr']}] node:{csi['node_id']} "
                                 f"seq:{csi['sequence']} sc:{csi['n_subcarriers']} "
                                 f"rssi:{csi['rssi_dbm']}dBm amp:{csi['mean_amplitude']:.1f} "
-                                f"=> {result.motion_level.value} ({result.confidence:.0%})"
+                                f"=> {result.motion_level.value} ({result.confidence:.0%}) | {result.details}"
                             )
                 else:
                     logger.debug("Waiting for samples (%d/%d)", len(samples), n_needed)
@@ -476,7 +651,9 @@ class SensingWebSocketServer:
 
         self.collector = self._create_collector()
         self.collector.start()
+        # flip the flag before starting the puller, it exits when _running is False
         self._running = True
+        self._start_tcp_feed()
 
         print(f"\n  Sensing WebSocket server on ws://{HOST}:{PORT}")
         print(f"  Source: {self.source}")

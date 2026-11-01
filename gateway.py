@@ -970,9 +970,17 @@ class Handler(BaseHTTPRequestHandler):
         self._ws_stream_pose(builder=build_sensing_stream_message)
 
     def _ws_recv_exact(self, n):
+        # Read through the handler's buffered reader, never the raw socket:
+        # BaseHTTPRequestHandler already pulls request bytes into ``rfile``, so
+        # mixing ``connection.recv`` in silently drops whatever ``rfile`` has
+        # pre-buffered. That only shows up behind a proxy (Render/Cloudflare),
+        # where a multi-segment >1 KiB frame arrives split and the read blocks
+        # forever on bytes that were swallowed.
+        if n <= 0:
+            return b""
         buf = b""
         while len(buf) < n:
-            chunk = self.connection.recv(n - len(buf))
+            chunk = self.rfile.read(n - len(buf))
             if not chunk:
                 return None
             buf += chunk

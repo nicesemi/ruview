@@ -5,7 +5,7 @@
 // that ran it hold a permanently signed-out answer. `activate` deletes every
 // cache whose name is not CACHE_NAME, so bumping is what evicts it from clients
 // already in the field. Bump again if a future change poisons the cache.
-const CACHE_NAME = 'ruview-v6';
+const CACHE_NAME = 'ruview-v7';
 
 // Requests whose response depends on the caller's credentials. These must never
 // be served from the Cache API.
@@ -114,13 +114,39 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Static assets and the app shell: cache-first with network fallback.
+  // Static assets and the app shell: serve cached copy immediately, refresh in
+  // the background. Cache-first (the old strategy) meant a deployed UI change
+  // stayed invisible until CACHE_NAME was bumped by hand, which is exactly how
+  // a shipped panel appeared to be missing.
   if (request.mode === 'navigate' || STATIC_ASSET.test(url.pathname)) {
-    event.respondWith(cacheFirst(request));
+    event.respondWith(staleWhileRevalidate(event));
   }
 
   // Anything else is left alone and goes to the network as normal.
 });
+
+async function staleWhileRevalidate(event) {
+  const request = event.request;
+  const cache = await caches.open(CACHE_NAME);
+  const cached = await cache.match(request, { ignoreSearch: true });
+  const refresh = fetch(request).then((response) => {
+    if (response && response.ok) {
+      const key = new URL(request.url);
+      key.search = '';
+      cache.put(key.toString(), response.clone());
+    }
+    return response;
+  }).catch(() => null);
+  event.waitUntil(refresh);
+  if (cached) return cached;
+  const fresh = await refresh;
+  if (fresh) return fresh;
+  if (request.mode === 'navigate') {
+    const shell = await caches.match('/index.html');
+    if (shell) return shell;
+  }
+  return new Response('Offline', { status: 503, statusText: 'Service Unavailable' });
+}
 
 async function cacheFirst(request) {
   // `ignoreSearch` so the shell is a single entry. Sign-in redirects back to

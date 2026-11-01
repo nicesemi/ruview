@@ -202,6 +202,35 @@ export class LiveDemoTab {
                 </div>
               </div>
               
+              <div class="metrics-panel" id="room-state-panel">
+                <h4>房间状态</h4>
+                <div class="metric">
+                  <label>人员存在：</label>
+                  <span id="room-presence">--</span>
+                </div>
+                <div class="metric">
+                  <label>运动状态：</label>
+                  <span id="room-motion">--</span>
+                </div>
+                <div class="metric">
+                  <label>目标人数：</label>
+                  <span id="room-persons">--</span>
+                </div>
+                <div class="metric">
+                  <label>呼吸率：</label>
+                  <span id="room-breath">--</span>
+                </div>
+                <div class="metric">
+                  <label>信号强度：</label>
+                  <span id="room-rssi">--</span>
+                </div>
+                <div class="metric">
+                  <label>分类置信度：</label>
+                  <span id="room-conf">--</span>
+                </div>
+                <div class="metric-note" id="room-note"></div>
+              </div>
+
               <div class="pose-source-panel">
                 <h4>Estimation Mode</h4>
                 <div class="pose-source-indicator" id="pose-source-indicator">
@@ -1097,11 +1126,16 @@ export class LiveDemoTab {
     });
     // Throttle data-based banner updates (frames arrive at 10Hz)
     let lastBannerUpdate = 0;
-    this._sensingDataUnsub = sensingService.onData(() => {
+    let lastRoomUpdate = 0;
+    this._sensingDataUnsub = sensingService.onData((data) => {
       const now = Date.now();
       if (now - lastBannerUpdate > 2000) {
         lastBannerUpdate = now;
         this.updateSourceBanner();
+      }
+      if (now - lastRoomUpdate > 500) {
+        lastRoomUpdate = now;
+        this.updateRoomState(data);
       }
     });
     // Initial banner update
@@ -1357,6 +1391,54 @@ export class LiveDemoTab {
     
     if (zoneSelector) {
       zoneSelector.disabled = this.state.isActive;
+    }
+  }
+
+  /**
+   * Render the room-state block from the frame the gateway just pushed.
+   * Everything shown here is measured: presence/motion come from the sensing
+   * classifier, the breathing rate from the breathing-band spectral peak. When
+   * a value is not measurable the field says so instead of showing a guess.
+   */
+  updateRoomState(data) {
+    const panel = this.container.querySelector('#room-state-panel');
+    if (!panel) return;
+    const set = (id, text) => {
+      const el = this.container.querySelector(`#${id}`);
+      if (el) el.textContent = text;
+    };
+
+    const room = (data && data.room_state) || {};
+    const vit = (data && data.vital_signs) || {};
+    const cls = (data && data.classification) || {};
+    const feat = (data && data.features) || {};
+
+    const live = sensingService.dataSource === 'live';
+    const presence = typeof room.presence === 'boolean' ? room.presence : !!cls.presence;
+    const motion = room.motion_level || cls.motion_level || 'absent';
+    const motionLabels = { active: '运动中', moving: '轻动', present: '静止在场', still: '静止在场', absent: '无人' };
+    const persons = typeof room.persons === 'number' ? room.persons : (presence ? 1 : 0);
+    const conf = typeof room.confidence === 'number' ? room.confidence : (cls.confidence || 0);
+    const rssi = typeof room.rssi_dbm === 'number' ? room.rssi_dbm : feat.mean_rssi;
+
+    set('room-presence', !live ? '无硬件信号' : (presence ? '有人在场' : '无人'));
+    set('room-motion', live ? (motionLabels[motion] || motion) : '--');
+    set('room-persons', live ? String(persons) : '--');
+    set('room-rssi', typeof rssi === 'number' ? `${rssi.toFixed(1)} dBm` : '--');
+    set('room-conf', live ? `${Math.round(conf * 100)}%` : '--');
+
+    const bpm = typeof vit.breathing_rate_bpm === 'number' ? vit.breathing_rate_bpm : null;
+    set('room-breath', bpm !== null ? `${bpm} 次/分` : (live ? '不可测' : '--'));
+
+    const note = this.container.querySelector('#room-note');
+    if (note) {
+      note.textContent = live && vit.note ? vit.note : '';
+      note.style.display = live && vit.note ? 'block' : 'none';
+    }
+
+    const presEl = this.container.querySelector('#room-presence');
+    if (presEl) {
+      presEl.className = !live ? 'health-sim' : (presence ? 'health-good' : 'health-bad');
     }
   }
 

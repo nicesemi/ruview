@@ -419,6 +419,112 @@ def node_count(frame):
     return len(nodes)
 
 
+# ── vital signs (derived from measured CSI, never invented) ─────────────────
+# Resting human breathing sits at 0.12-0.55 Hz (7-33 bpm). The sensing pipeline
+# reports one dominant spectral peak per frame plus the power inside the
+# breathing band, which is the only evidence available. Heart rate needs a
+# dedicated cardiac-band model that this sensing-only build does not ship, so
+# it is reported as unavailable instead of a fabricated number.
+BREATH_BAND_MIN_HZ = 0.12
+BREATH_BAND_MAX_HZ = 0.55
+BREATH_MIN_POWER_RATIO = 0.05
+
+
+def first_features(frame):
+    if not frame:
+        return {}
+    feat = frame.get("features")
+    if isinstance(feat, dict) and feat:
+        return feat
+    for node in (frame.get("node_features") or frame.get("nodes") or []):
+        if not isinstance(node, dict):
+            continue
+        inner = node.get("node_features")
+        if isinstance(inner, list) and inner and isinstance(inner[0], dict):
+            return inner[0]
+        if inner is None and ("dominant_freq_hz" in node or "mean_rssi" in node):
+            return node
+    return {}
+
+
+def build_vital_signs(frame=None):
+    """Breathing rate from the measured breathing-band peak, else null."""
+    if frame is None:
+        frame = live_state()[0]
+    empty = {
+        "breathing_rate_bpm": None,
+        "breathing_confidence": 0.0,
+        "heart_rate_bpm": None,
+        "heart_rate_confidence": 0.0,
+        "measurable": False,
+        "note": "",
+    }
+    if not frame:
+        empty["note"] = "无感知帧"
+        return empty
+    cls = frame.get("classification") or {}
+    if not cls.get("presence"):
+        empty["note"] = "房间内无人，无生命体征可测"
+        return empty
+
+    feat = first_features(frame)
+    try:
+        dom = float(feat.get("dominant_freq_hz") or 0.0)
+        band = float(feat.get("breathing_band_power") or 0.0)
+        total = float(feat.get("spectral_power") or 0.0)
+    except (TypeError, ValueError):
+        dom, band, total = 0.0, 0.0, 0.0
+    ratio = band / total if total > 0 else 0.0
+    level = str(cls.get("motion_level") or "").lower()
+
+    if level == "active":
+        empty["note"] = "运动中：运动成分淹没呼吸频带，此帧不可测"
+        return empty
+    if not (BREATH_BAND_MIN_HZ <= dom <= BREATH_BAND_MAX_HZ):
+        empty["note"] = f"主频谱峰 {dom:.2f} Hz 不在呼吸带内"
+        return empty
+    if ratio < BREATH_MIN_POWER_RATIO:
+        empty["note"] = "呼吸带功率占比过低，未检出可靠呼吸节律"
+        return empty
+
+    return {
+        "breathing_rate_bpm": round(dom * 60.0, 1),
+        "breathing_confidence": round(min(0.9, ratio * 3.0), 2),
+        "heart_rate_bpm": None,
+        "heart_rate_confidence": 0.0,
+        "measurable": True,
+        "note": "呼吸率由实测呼吸带谱峰推得；心率需专用心搏频带模型，本构建不提供",
+    }
+
+
+def build_room_state(frame=None):
+    """One compact block answering: is someone there, and in what state?"""
+    if frame is None:
+        frame = live_state()[0]
+    if not frame:
+        return {"presence": False, "motion_level": "absent", "persons": 0,
+                "confidence": 0.0, "available": False}
+    cls = frame.get("classification") or {}
+    feat = first_features(frame)
+    presence = bool(cls.get("presence"))
+    try:
+        rssi = round(float(feat.get("mean_rssi") or 0.0), 2)
+        variance = round(float(feat.get("variance") or 0.0), 2)
+        motion_power = round(float(feat.get("motion_band_power") or 0.0), 2)
+    except (TypeError, ValueError):
+        rssi, variance, motion_power = 0.0, 0.0, 0.0
+    return {
+        "presence": presence,
+        "motion_level": cls.get("motion_level") or ("present" if presence else "absent"),
+        "persons": 1 if presence else 0,
+        "confidence": round(float(cls.get("confidence") or 0.0), 2),
+        "rssi_dbm": rssi,
+        "variance": variance,
+        "motion_band_power": motion_power,
+        "available": True,
+    }
+
+
 # Frames carrying one of these sources come from hardware the reader actually
 # owns. Everything else (the upstream collector's simulated fallback) must never
 # be reported as a verified live link — otherwise unplugging the ESP32 leaves
@@ -699,6 +805,8 @@ def build_sensing_current():
     out = dict(frame)
     out["source_state"] = source_state()
     out["live"] = is_live
+    out["vital_signs"] = build_vital_signs(frame)
+    out["room_state"] = build_room_state(frame)
     return out
 
 
@@ -759,6 +867,8 @@ def build_pose_current():
             "source": "unknown",
             "timestamp": time.time(),
             "live": False,
+            "vital_signs": build_vital_signs(frame),
+            "room_state": build_room_state(frame),
         }
     cls = frame.get("classification") or {}
     features = frame.get("features") or {}
@@ -802,6 +912,8 @@ def build_pose_current():
         "frame_age_s": round(age, 3) if age is not None else None,
         "timestamp": frame.get("timestamp") or time.time(),
         "live": True,
+        "vital_signs": build_vital_signs(frame),
+        "room_state": build_room_state(frame),
     }
 
 
@@ -1110,28 +1222,11 @@ def build_sensing_stream_message(frame):
                 }
             ]
     # UI contract (ui/observatory/hud-controller.js + figure-pool.js): the HUD
-    # reads vital_signs.* and estimated_persons; both are derived from real
-    # upstream features, never synthesised. Heart rate is not observable from
-    # CSI alone in this build, so it stays 0 and the HUD renders "--".
-    feats = frame.get("features") or {}
-    br_bpm = 0.0
-    try:
-        dom_hz = float(feats.get("dominant_freq_hz") or 0.0)
-        if 0.05 <= dom_hz <= 1.0:
-            br_bpm = round(dom_hz * 60.0, 1)
-    except (TypeError, ValueError):
-        br_bpm = 0.0
-    conf = 0.0
-    try:
-        conf = float(cls.get("confidence") or 0.0)
-    except (TypeError, ValueError):
-        conf = 0.0
-    out["vital_signs"] = {
-        "breathing_rate_bpm": br_bpm,
-        "heart_rate_bpm": 0.0,
-        "breathing_confidence": conf if br_bpm > 0 else 0.0,
-        "heart_rate_confidence": 0.0,
-    }
+    # reads vital_signs.* and estimated_persons. Both come from measured CSI via
+    # build_vital_signs(); a value that cannot be measured stays null so the HUD
+    # shows "不适用" instead of a plausible-looking invention.
+    out["vital_signs"] = build_vital_signs(frame)
+    out["room_state"] = build_room_state(frame)
     out["estimated_persons"] = len(out.get("persons") or [])
     return out
 

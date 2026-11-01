@@ -22,7 +22,7 @@ import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gateway")
@@ -35,12 +35,24 @@ PORT = int(os.environ.get("PORT") or 8080)
 WS_UPSTREAM = os.environ.get("WS_UPSTREAM") or "ws://127.0.0.1:8765/ws/sensing"
 STALE_AFTER_S = 5.0
 
+# A PaaS container has no inbound UDP, so an ESP32 on a home LAN can never push
+# CSI at the cloud directly. A bridge running inside that LAN connects *out* to
+# /ws/ingest and replays the frames the local ws_server already produced. While
+# those arrive, they outrank the container's own (necessarily synthetic or
+# lan-less) upstream feed.
+INGEST_TOKEN = os.environ.get("INGEST_TOKEN") or "ruview-ingest"
+INGEST_PRIORITY_S = 8.0
+INGEST_MAX_FRAME_BYTES = 512 * 1024
+
 STATE = {
     "frame": None,
     "frame_ts": 0.0,
     "ws_state": "connecting",
     "frames": 0,
     "started": time.time(),
+    "ingest_ts": 0.0,
+    "ingest_frames": 0,
+    "ingest_peer": None,
 }
 LOCK = threading.Lock()
 
@@ -350,6 +362,10 @@ def ws_feed():
                         except (ValueError, TypeError):
                             continue
                         with LOCK:
+                            if time.time() - STATE["ingest_ts"] < INGEST_PRIORITY_S:
+                                # The LAN bridge is feeding real CSI; the local
+                                # (synthetic) collector must not overwrite it.
+                                continue
                             STATE["frame"] = data
                             STATE["frame_ts"] = time.time()
                             STATE["frames"] += 1
@@ -422,6 +438,11 @@ def build_status():
         "frame_age_s": round(age, 3) if age is not None else None,
         "frames_received": frames,
         "uptime_s": round(time.time() - started, 1),
+        "ingest_frames": STATE["ingest_frames"],
+        "ingest_peer": STATE["ingest_peer"],
+        "ingest_age_s": (
+            round(time.time() - STATE["ingest_ts"], 1) if STATE["ingest_ts"] else None
+        ),
         "timestamp": time.time(),
     }
 
@@ -948,6 +969,103 @@ class Handler(BaseHTTPRequestHandler):
         """`/ws/sensing`: the raw upstream frame the observatory expects."""
         self._ws_stream_pose(builder=build_sensing_stream_message)
 
+    def _ws_recv_exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.connection.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def _ws_recv_client_frame(self):
+        """Blocking read of one client frame -> (alive, opcode, payload)."""
+        head = self._ws_recv_exact(2)
+        if head is None:
+            return False, 0x8, b""
+        opcode = head[0] & 0x0F
+        masked = bool(head[1] & 0x80)
+        length = head[1] & 0x7F
+        if length == 126:
+            ext = self._ws_recv_exact(2)
+            if ext is None:
+                return False, 0x8, b""
+            length = struct.unpack(">H", ext)[0]
+        elif length == 127:
+            ext = self._ws_recv_exact(8)
+            if ext is None:
+                return False, 0x8, b""
+            length = struct.unpack(">Q", ext)[0]
+        if length > INGEST_MAX_FRAME_BYTES:
+            log.warning("ingest frame too large (%d bytes), dropping peer", length)
+            return False, 0x8, b""
+        mask = self._ws_recv_exact(4) if masked else b""
+        if mask is None:
+            return False, 0x8, b""
+        payload = self._ws_recv_exact(length) if length else b""
+        if payload is None:
+            return False, 0x8, b""
+        if masked and mask:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        return True, opcode, payload
+
+    def _ws_stream_ingest(self):
+        """`/ws/ingest`: an out-of-network bridge pushes real CSI frames in.
+
+        The bridge authenticates with `?token=`, then streams the same
+        `sensing_update` JSON that ws_server emits. Accepted frames become the
+        gateway's current frame, so /health, /api/v1/sensing and both live
+        streams report `source: esp32` instead of the simulated fallback.
+        """
+        token = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
+        if token != INGEST_TOKEN:
+            self._send_json({"detail": "invalid ingest token"}, 403)
+            return
+        if not self._ws_handshake():
+            self._send_json({"detail": "websocket upgrade required"}, 400)
+            return
+        peer = self.address_string()
+        with LOCK:
+            STATE["ingest_peer"] = peer
+        log.info("ingest bridge connected from %s", peer)
+        self.close_connection = True
+        accepted = 0
+        try:
+            while True:
+                alive, opcode, payload = self._ws_recv_client_frame()
+                if not alive:
+                    break
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    self.wfile.write(ws_frame(payload, opcode=0xA))
+                    self.wfile.flush()
+                    continue
+                if opcode != 0x1:
+                    continue
+                try:
+                    data = json.loads(payload.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                data.setdefault("type", "sensing_update")
+                data.setdefault("source", "esp32")
+                now = time.time()
+                with LOCK:
+                    STATE["frame"] = data
+                    STATE["frame_ts"] = now
+                    STATE["frames"] += 1
+                    STATE["ingest_ts"] = now
+                    STATE["ingest_frames"] += 1
+                    accepted = STATE["ingest_frames"]
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with LOCK:
+                STATE["ingest_peer"] = None
+            log.info("ingest bridge disconnected from %s (%d frames total)", peer, accepted)
+
     def _ws_stream_train_progress(self):
         """`/ws/train/progress`: push the in-memory training state each epoch."""
         if not self._ws_handshake():
@@ -985,6 +1103,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self._is_ws_upgrade() and path.rstrip("/") == "/ws/sensing":
             self._ws_stream_sensing()
+            return
+        if self._is_ws_upgrade() and path.rstrip("/") == "/ws/ingest":
+            self._ws_stream_ingest()
             return
         if self._is_ws_upgrade() and path.rstrip("/") == "/ws/train/progress":
             self._ws_stream_train_progress()

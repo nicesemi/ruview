@@ -1433,7 +1433,17 @@ class Handler(BaseHTTPRequestHandler):
                 data.setdefault("type", "sensing_update")
                 data.setdefault("source", "esp32")
                 now = time.time()
+                stamp = data.get("timestamp")
                 with LOCK:
+                    prev = STATE["frame"] or {}
+                    if stamp is not None and prev.get("timestamp") == stamp:
+                        # Byte-identical frame re-sent by a bridge that is
+                        # replaying its ring buffer after the node went away.
+                        # Count the traffic but never refresh frame_ts, so the
+                        # link still ages out to `disconnected`.
+                        STATE["ingest_frames"] += 1
+                        accepted = STATE["ingest_frames"]
+                        continue
                     STATE["frame"] = data
                     STATE["frame_ts"] = now
                     STATE["frames"] += 1

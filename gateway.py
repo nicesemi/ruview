@@ -887,14 +887,32 @@ def build_zones_summary():
         peak = max(energies.values()) or 1.0
         for zone, energy in energies.items():
             zones[zone]["energy"] = round(energy / peak, 3)
-            zones[zone]["occupancy"] = round(min(energy / peak, 1.0), 3)
+            zones[zone]["relative_energy"] = round(min(energy / peak, 1.0), 3)
 
-    cls = (frame or {}).get("classification") or {}
-    if cls.get("presence"):
+    # Same single source of truth as /api/v1/pose/current and /api/v1/sensing.
+    room = build_room_state(frame)
+    presence = bool(room.get("presence"))
+    verdict_persons = room.get("persons")
+    persons = verdict_persons if isinstance(verdict_persons, int) and verdict_persons > 0 else 0
+    if presence and persons <= 0:
+        persons = 1
+    if presence:
         hot = max(energies, key=energies.get)
-        zones[hot]["person_count"] = 1
+        # Only the strongest quadrant can be located; the rest of the room keeps
+        # a normalised energy reading instead of a fake occupancy figure.
+        for zone, data in zones.items():
+            ratio = data.pop("relative_energy", 0.0)
+            data["occupancy"] = ratio if zone == hot else 0.0
+        zones[hot]["person_count"] = persons
         zones[hot]["present"] = True
-        summary["total_persons"] = 1
+        summary["total_persons"] = persons
+        summary["persons_basis"] = room.get("persons_basis")
+    else:
+        # Nobody present: the field is background noise, so occupancy stays at 0
+        # while the raw energy ratio is preserved for debugging.
+        for data in zones.values():
+            data.pop("relative_energy", None)
+            data["occupancy"] = 0.0
     summary["occupied_zones"] = sum(1 for z in zones.values() if z["present"])
     return {"zones": zones, "summary": summary}
 
@@ -973,21 +991,37 @@ def build_pose_current():
         }
     cls = frame.get("classification") or {}
     features = frame.get("features") or {}
+    # The room verdict is the single source of truth for "is someone there and
+    # how many": it fuses both links, the presence smoother and the cross-link
+    # correlation. Reading `classification.presence` here made the dashboard
+    # disagree with /api/v1/sensing (0 vs 有人) on the very same frame.
+    room = build_room_state(frame)
+    presence = bool(room.get("presence"))
+    verdict_persons = room.get("persons")
+    count = verdict_persons if isinstance(verdict_persons, int) and verdict_persons > 0 else 0
+    if presence and count <= 0:
+        count = 1
+    motion_level = room.get("motion_level") or cls.get("motion_level")
     persons = []
-    # Only report a person when the sensing pipeline itself classifies presence.
-    if cls.get("presence"):
+    if presence:
         bbox = ws_bbox_from_field(frame.get("signal_field"))
-        persons.append(
-            {
-                "person_id": 1,
-                "confidence": float(cls.get("confidence") or 0.0),
-                "motion_level": cls.get("motion_level"),
-                # Same signal-derived skeleton the Live Demo canvas draws.
-                "keypoints": derive_keypoints(frame, bbox),
-                "bbox": bbox,
-                "label": "person",
-            }
-        )
+        confidence = float(room.get("confidence") or cls.get("confidence") or 0.0)
+        for index in range(count):
+            # Only the strongest disturbance can be localised from one field, so
+            # the first body carries the signal-derived skeleton and any further
+            # count is reported without inventing a location for it.
+            persons.append(
+                {
+                    "person_id": index + 1,
+                    "confidence": confidence,
+                    "motion_level": motion_level,
+                    "keypoints": derive_keypoints(frame, bbox) if index == 0 else None,
+                    "bbox": bbox if index == 0 else None,
+                    "localized": index == 0,
+                    "label": "person",
+                    "basis": room.get("persons_basis"),
+                }
+            )
     avg_conf = (
         round(sum(float(p.get("confidence") or 0.0) for p in persons) / len(persons), 3)
         if persons
@@ -995,8 +1029,8 @@ def build_pose_current():
     )
     pose = {
         "persons": persons,
-        "motion_level": cls.get("motion_level"),
-        "presence": bool(cls.get("presence")),
+        "motion_level": motion_level,
+        "presence": presence,
         "features": features,
     }
     return {

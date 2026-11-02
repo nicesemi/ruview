@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
+import math
 import os
 import socket
 import sys
@@ -53,23 +55,161 @@ import websockets  # noqa: E402
 STALE_UDP_S = 3.0
 
 
-def _compact(raw: str, decimals: int = 1) -> str:
+# Render's edge proxy silently blackholes ingest frames that are too large:
+# against ruview.tech a 4324-byte payload never arrives while 3458 bytes does,
+# and the sender gets neither an error nor a close frame. 3400 keeps a margin
+# under the last size observed to arrive.
+FRAME_BUDGET_BYTES = 3400
+
+# Set RUVIEW_BRIDGE_DEBUG=1 to log the wire size of every compacted frame.
+DEBUG = os.environ.get("RUVIEW_BRIDGE_DEBUG") == "1"
+
+
+def _debug(message: str) -> None:
+    print("[bridge] %s" % message, flush=True)
+
+
+def _round_vals(vals, decimals: int):
+    return [round(v, decimals) if isinstance(v, float) else v for v in vals]
+
+
+def _grid_dims(field: dict, count: int):
+    """(width, height) of a flat row-major grid payload, or (0, 0)."""
+    grid = field.get("grid_size")
+    if isinstance(grid, (list, tuple)) and len(grid) >= 3:
+        try:
+            width, height = int(grid[0]), int(grid[2])
+        except (TypeError, ValueError):
+            width = height = 0
+        if width > 0 and height > 0 and width * height == count:
+            return width, height
+    side = int(round(math.sqrt(count)))
+    return (side, side) if side * side == count else (0, 0)
+
+
+def _downsample_grid(values, width: int, max_side: int):
+    """Box-average a square grid down to max_side cells per axis."""
+    if width <= max_side or width * width != len(values):
+        return values
+    target = max_side
+    out = []
+    for ty in range(target):
+        y0 = ty * width // target
+        y1 = max(y0 + 1, (ty + 1) * width // target)
+        for tx in range(target):
+            x0 = tx * width // target
+            x1 = max(x0 + 1, (tx + 1) * width // target)
+            total = 0.0
+            seen = 0
+            for y in range(y0, y1):
+                row = y * width
+                for x in range(x0, x1):
+                    value = values[row + x]
+                    if isinstance(value, (int, float)):
+                        total += float(value)
+                        seen += 1
+            out.append(total / seen if seen else 0.0)
+    return out
+
+
+def _round_floats(obj, ndigits: int):
+    """Recursively round every float in the payload.
+
+    Python's float repr is the single biggest cost in a sensing_update: values
+    like 1278.3889834581 spend 15 bytes to say what 1278.389 says in 8. The UI
+    paints at pixel resolution, so 3 decimals is lossless in practice.
+    """
+    if isinstance(obj, float):
+        return round(obj, ndigits)
+    if isinstance(obj, dict):
+        return {k: _round_floats(v, ndigits) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_round_floats(v, ndigits) for v in obj]
+    return obj
+
+
+def _shrink_field(field, decimals: int, max_side: int) -> None:
+    if not isinstance(field, dict):
+        return
+    values = field.get("values")
+    if not isinstance(values, list) or not values:
+        return
+    width, height = _grid_dims(field, len(values))
+    if width and height and max_side and width > max_side:
+        values = _downsample_grid(values, width, max_side)
+        side = int(round(math.sqrt(len(values))))
+        if side * side == len(values):
+            field["grid_size"] = [side, 1, side]
+    field["values"] = _round_vals(values, decimals)
+
+
+def _shrink_nodes(data: dict, decimals: int, max_amp: int) -> None:
+    nodes = data.get("node_features")
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        # The UI rebuilds its own history from successive frames, so shipping a
+        # server-side history is pure payload bloat.
+        node.pop("amplitude_history", None)
+        amp = node.get("amplitude")
+        if isinstance(amp, list) and amp:
+            if max_amp <= 0:
+                node.pop("amplitude", None)
+            else:
+                if len(amp) > max_amp:
+                    amp = amp[::math.ceil(len(amp) / max_amp)]
+                node["amplitude"] = _round_vals(amp, decimals)
+        for key in ("mean_amplitude", "variance", "motion_band_power",
+                    "breathing_band_power", "rssi_dbm", "confidence"):
+            value = node.get(key)
+            if isinstance(value, float):
+                node[key] = round(value, 3)
+
+
+def _compact(raw: str, decimals: int = 1,
+             budget: int = FRAME_BUDGET_BYTES) -> str:
     """Shrink a sensing_update so it survives the cloud proxy's frame ceiling.
 
-    The 20x20 ``signal_field.values`` block alone is ~6 KB once Python's float
-    repr is applied. Render's edge proxy silently stalls ingest frames above
-    roughly 4-8 KB, so values are rounded and re-serialised without spaces.
+    The 20x20 ``signal_field.values`` block plus two per-node amplitude arrays
+    used to serialise to ~4.3 KB, which the edge proxy drops on the floor. Each
+    pass below is more aggressive than the last; the first one that fits the
+    budget wins so fidelity degrades only as far as it has to.
     """
     try:
         data = json.loads(raw)
     except ValueError:
         return raw
-    field = data.get("signal_field")
-    if isinstance(field, dict) and isinstance(field.get("values"), list):
-        field["values"] = [
-            round(v, decimals) if isinstance(v, float) else v for v in field["values"]
-        ]
-    return json.dumps(data, separators=(",", ":"))
+
+    passes = [
+        # (field decimals, field max side, per-node amplitude points)
+        # Keep one decimal on the field: the heatmap range is 0..1.2, so
+        # rounding to integers would flatten it into a 0/1 bitmap.
+        (1, 20, 28),
+        (1, 16, 20),
+        (1, 12, 16),
+        (1, 10, 12),
+        (1, 8, 0),    # last resort: drop per-node amplitude entirely
+    ]
+    smallest = raw
+    for index, (field_decimals, max_side, max_amp) in enumerate(passes):
+        trial = _round_floats(copy.deepcopy(data), 3)
+        _shrink_field(trial.get("signal_field"), field_decimals, max_side)
+        _shrink_nodes(trial, field_decimals, max_amp)
+        encoded = json.dumps(trial, separators=(",", ":"), default=float)
+        if len(encoded) < len(smallest):
+            smallest = encoded
+        if len(encoded) <= budget:
+            if DEBUG:
+                field = trial.get("signal_field") or {}
+                _debug("frame %d->%d bytes (pass %d, grid %s)"
+                       % (len(raw), len(encoded), index,
+                          (field.get("grid_size") or ["?"])[0]))
+            return encoded
+    if DEBUG:
+        _debug("frame %d->%d bytes (BUDGET MISS)" % (len(raw), len(smallest)))
+    return smallest
 
 
 class TcpMirror:
@@ -135,6 +275,7 @@ class Bridge:
                                         on_raw=self._on_raw)
         self._last_packets = 0
         self._last_packet_ts = time.time()
+        self._dumped = False
 
     @staticmethod
     def _parse_targets(spec: str):
@@ -195,6 +336,16 @@ class Bridge:
         if not tracks:
             return None
         msg = self.sensing.build_message()
+        dump = os.environ.get("RUVIEW_BRIDGE_DUMP")
+        if dump and self._dumped < int(os.environ.get("RUVIEW_BRIDGE_DUMP_MAX") or 1):
+            try:
+                path = dump if self._dumped == 0 else "%s.%d" % (dump, self._dumped)
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(msg)
+                self._dumped += 1
+                _debug("dumped frame %d to %s (%d bytes)" % (self._dumped, path, len(msg)))
+            except OSError:
+                pass
         return _compact(msg) if self.compact else msg
 
 

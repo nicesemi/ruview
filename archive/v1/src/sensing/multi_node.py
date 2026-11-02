@@ -90,7 +90,11 @@ class NodeTrack:
         self.first_seen: float = 0.0
         self.frames: int = 0
         self.sequence: int = -1
-        # measured arrival rate per node, EMA -- the number the FFT axis needs
+        # measured arrival rate per node -- the number the FFT axis needs.
+        # Cumulative average, not an EMA of 1/dt: the boards deliver bursts, so
+        # a per-packet instantaneous rate swings between ~40 and ~500 Hz and
+        # would drag the recalculated sample rate (and hence every frequency
+        # bin) around with it.
         self.fps: float = 0.0
         self.smoother = presence_v2.PresenceSmoother(window=21)
         self.v2: Optional[presence_v2.PresenceResult] = None
@@ -102,16 +106,14 @@ class NodeTrack:
     # -- ingest ------------------------------------------------------------
     def add_sample(self, sample: WifiSample) -> None:
         now = sample.timestamp
-        if self.last_seen:
-            dt = now - self.last_seen
-            if 0.0 < dt < 1.0:
-                inst = 1.0 / dt
-                self.fps = inst if self.fps <= 0 else (0.85 * self.fps + 0.15 * inst)
-        else:
+        if not self.first_seen:
             self.first_seen = now
         self.last_seen = now
         self.samples.append(sample)
         self.frames += 1
+        span = now - self.first_seen
+        if span > 0.5:
+            self.fps = self.frames / span
 
     def add_iq(self, ts: float, n_sc: int, iq_pairs) -> None:
         self.sc_hist.append((ts, int(n_sc), iq_pairs))

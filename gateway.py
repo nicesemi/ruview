@@ -47,9 +47,26 @@ INGEST_TOKEN = os.environ.get("INGEST_TOKEN") or "ruview-ingest"
 INGEST_PRIORITY_S = 8.0
 INGEST_MAX_FRAME_BYTES = 512 * 1024
 
+# Per-node frame cache. The LAN bridge sends one node per frame, so a plain
+# `STATE["frame"] = data` assignment makes two boards overwrite each other and
+# the dashboard can never see more than one node. Every ingest now also stamps
+# the frame into this dict and the served frame is the merge of all nodes seen
+# within NODE_TTL_S.
+NODE_TTL_S = float(os.environ.get("RUVIEW_NODE_TTL_S") or 20.0)
+
+# DSP metrics copied onto each node when several nodes are merged, so every
+# link keeps its own variance / motion energy instead of the view collapsing to
+# whichever node reported last.
+NODE_METRIC_KEYS = (
+    "mean_rssi", "variance", "std", "iqr", "motion_band_power",
+    "breathing_band_power", "dominant_freq_hz", "change_points",
+    "spectral_power", "range", "skewness", "kurtosis",
+)
+
 STATE = {
     "frame": None,
     "frame_ts": 0.0,
+    "node_frames": {},
     "ws_state": "connecting",
     "frames": 0,
     "started": time.time(),
@@ -445,6 +462,64 @@ def first_features(frame):
         if inner is None and ("dominant_freq_hz" in node or "mean_rssi" in node):
             return node
     return {}
+
+
+def node_key(frame):
+    """Stable identity of the node a bridge frame came from, or None."""
+    if not isinstance(frame, dict):
+        return None
+    for node in (frame.get("node_features") or frame.get("nodes") or []):
+        if isinstance(node, dict) and node.get("node_id") is not None:
+            return str(node.get("node_id"))
+    nid = frame.get("node_id")
+    return str(nid) if nid is not None else None
+
+
+def merge_node_frames(now=None):
+    """Merge every node seen within NODE_TTL_S into one frame.
+
+    Called under LOCK. One live node returns that node's frame untouched, so a
+    single-board setup behaves exactly as before. Two or more nodes return a
+    frame whose node_features/nodes carry every node, which is what lets
+    /api/v1/sensing, the WS stream and the observatory see a multi-link view.
+    """
+    now = time.time() if now is None else now
+    cache = STATE.get("node_frames") or {}
+    live = {k: v for k, v in cache.items() if now - v[1] <= NODE_TTL_S}
+    if len(live) != len(cache):
+        STATE["node_frames"] = live
+    if not live:
+        return STATE.get("frame")
+    ordered = sorted(live.items(), key=lambda kv: kv[1][1], reverse=True)
+    if len(ordered) == 1:
+        return ordered[0][1][0]
+    base = dict(ordered[0][1][0])
+    nodes = []
+    for _key, (fr, _ts) in ordered:
+        mfeat = fr.get("features") if isinstance(fr.get("features"), dict) else {}
+        for node in (fr.get("node_features") or fr.get("nodes") or []):
+            if isinstance(node, dict):
+                node = dict(node)
+                # Attach the per-node DSP metrics of the frame this node came
+                # from. The bridge's node objects only describe the radio
+                # (rssi_dbm/amplitude/freq), so without this a multi-node view
+                # has no per-link variance or motion energy to reason about.
+                if mfeat and "metrics" not in node:
+                    node["metrics"] = {k: mfeat.get(k) for k in NODE_METRIC_KEYS
+                                       if k in mfeat}
+                nodes.append(node)
+    if nodes:
+        base["node_features"] = nodes
+        base["nodes"] = nodes
+        # NOTE: keep base["features"] as it came from the freshest node frame.
+        # Node objects in `nodes`/`node_features` only carry rssi_dbm /
+        # amplitude / freq_mhz — they have no variance or motion_band_power, so
+        # promoting one of them to the top-level `features` would blank out
+        # room_state rssi/variance/motion and make vitals read "unmeasurable".
+    base["node_count"] = len(nodes) or len(ordered)
+    base["node_ids"] = [k for k, _ in ordered]
+    base["aggregated"] = True
+    return base
 
 
 def build_vital_signs(frame=None):
@@ -1539,7 +1614,10 @@ class Handler(BaseHTTPRequestHandler):
                         STATE["ingest_frames"] += 1
                         accepted = STATE["ingest_frames"]
                         continue
-                    STATE["frame"] = data
+                    _key = node_key(data)
+                    if _key is not None:
+                        STATE["node_frames"][_key] = (data, now)
+                    STATE["frame"] = merge_node_frames(now) or data
                     STATE["frame_ts"] = now
                     STATE["frames"] += 1
                     if (data.get("classification") or {}).get("presence"):

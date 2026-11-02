@@ -588,14 +588,40 @@ def build_room_state(frame=None):
         motion_power = round(float(feat.get("motion_band_power") or 0.0), 2)
     except (TypeError, ValueError):
         rssi, variance, motion_power = 0.0, 0.0, 0.0
+
+    # The bridge measures every link separately and ships its own room verdict.
+    # Trust it, because this process cannot tell one node's frames from another
+    # and used to answer with a hardcoded `1 if presence else 0`.
+    room = frame.get("room")
+    if isinstance(room, dict) and room.get("nodes") is not None:
+        persons = room.get("persons")
+        return {
+            "presence": bool(room.get("presence")),
+            "motion_level": room.get("motion_level") or "absent",
+            "persons": persons,
+            "confidence": round(float(room.get("confidence") or 0.0), 2),
+            "rssi_dbm": rssi,
+            "variance": variance,
+            "motion_band_power": motion_power,
+            "nodes": room.get("nodes"),
+            "present_nodes": room.get("present_nodes"),
+            "persons_basis": room.get("persons_basis"),
+            "cross_link_corr": room.get("cross_link_corr"),
+            "details": room.get("details"),
+            "available": True,
+        }
+
     return {
         "presence": presence,
         "motion_level": cls.get("motion_level") or ("present" if presence else "absent"),
-        "persons": 1 if presence else 0,
+        # No per-link evidence: the head count is genuinely unknown, so say so
+        # instead of inventing a 1.
+        "persons": None if presence else 0,
         "confidence": round(float(cls.get("confidence") or 0.0), 2),
         "rssi_dbm": rssi,
         "variance": variance,
         "motion_band_power": motion_power,
+        "persons_basis": "no_per_node_evidence",
         "available": True,
     }
 

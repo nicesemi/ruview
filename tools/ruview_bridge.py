@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""RuView LAN→cloud CSI bridge.
+"""RuView LAN->cloud CSI bridge.
 
 The PaaS container hosting ruview.tech has no inbound UDP, so the ESP32 on the
 home LAN can never reach it directly. This bridge runs inside the LAN, listens
-on UDP :5005 exactly like ws_server does, turns each ADR-018 CSI burst into the
-same `sensing_update` JSON ws_server would emit, and pushes it out to
+on UDP :5005 exactly like ws_server does, and pushes a `sensing_update` frame to
 `wss://ruview.tech/ws/ingest`. The cloud gateway then reports `source: esp32`.
+
+Two-node correctness
+--------------------
+The bridge used to feed every board into the upstream `Esp32UdpCollector`, whose
+single ring buffer / single `sc_hist` interleaves both links. That made variance
+a constant ~30 regardless of occupancy, put the FFT axis at ~30 fps so
+`dominant_freq_hz` read 33 Hz (above the real Nyquist limit), and made
+presence_v2 measure phase spread across two different physical links -- so the
+empty room read "occupied". `MultiNodeSensing` keeps one track per node and
+aggregates afterwards; see `v1/src/sensing/multi_node.py`.
 
 Usage:
     python ruview_bridge.py --target wss://ruview.tech --token ruview-ingest
@@ -16,23 +25,31 @@ import argparse
 import asyncio
 import json
 import os
+import socket
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ARCHIVE = os.path.join(HERE, "RuView", "archive")
+# Accept the three layouts this script is launched from: a standalone copy that
+# ships its own RuView checkout, a repo root, or <repo>/tools.
+_CANDIDATES = [
+    os.path.join(HERE, "RuView", "archive"),
+    os.path.join(HERE, "archive"),
+    os.path.join(os.path.dirname(HERE), "archive"),
+]
+ARCHIVE = next((p for p in _CANDIDATES if os.path.isdir(p)), _CANDIDATES[0])
 if ARCHIVE not in sys.path:
     sys.path.insert(0, ARCHIVE)
 
-from v1.src.sensing.ws_server import (  # noqa: E402
+from v1.src.sensing.multi_node import (  # noqa: E402
     ESP32_UDP_PORT,
-    Esp32UdpCollector,
-    SensingWebSocketServer,
+    MultiNodeSensing,
 )
 
 import websockets  # noqa: E402
 
-# Silence longer than this means the node is off/unplugged.
+# Silence longer than this means no node is delivering frames.
 STALE_UDP_S = 3.0
 
 
@@ -55,71 +72,138 @@ def _compact(raw: str, decimals: int = 1) -> str:
     return json.dumps(data, separators=(",", ":"))
 
 
-class Bridge:
-    """Local ESP32 UDP -> sensing_update JSON."""
+class TcpMirror:
+    """Fan raw bursts out over TCP for pullers that cannot receive UDP."""
 
-    def __init__(self, port: int = ESP32_UDP_PORT, sample_rate_hz: float = 10.0,
-                 compact: bool = True) -> None:
-        self.compact = compact
-        self.collector = Esp32UdpCollector(port=port, sample_rate_hz=sample_rate_hz)
-        # Reuse the upstream implementation so the cloud sees byte-identical
-        # frame semantics: same extractor window, same presence classifier.
-        self.server = SensingWebSocketServer()
-        self.server.collector = self.collector
-        self.server.source = "esp32"
-        self._last_seq = None
-        self._udp_count = 0
-        self._udp_ts = time.time()
+    def __init__(self, port: int) -> None:
+        self.port = int(port)
+        self._clients: list = []
+        self._lock = threading.Lock()
 
     def start(self) -> None:
-        self.collector.start()
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self.port))
+        srv.listen(4)
+
+        def accept_loop() -> None:
+            while True:
+                try:
+                    conn, addr = srv.accept()
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    with self._lock:
+                        self._clients.append(conn)
+                    print("[bridge] tcp mirror client %s:%s" % addr, flush=True)
+                except Exception:  # noqa: BLE001
+                    time.sleep(0.5)
+
+        threading.Thread(target=accept_loop, daemon=True, name="tcp-mirror").start()
+        print("[bridge] tcp mirror listening on :%d" % self.port, flush=True)
+
+    def send(self, raw: bytes) -> None:
+        if not self._clients:
+            return
+        packet = len(raw).to_bytes(4, "big") + raw
+        dead = []
+        with self._lock:
+            for conn in self._clients:
+                try:
+                    conn.sendall(packet)
+                except Exception:  # noqa: BLE001
+                    dead.append(conn)
+            for conn in dead:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._clients.remove(conn)
+
+
+class Bridge:
+    """Local multi-node CSI -> one aggregated sensing_update JSON."""
+
+    def __init__(self, port: int = ESP32_UDP_PORT, sample_rate_hz: float = 10.0,
+                 compact: bool = True, mirror: str = "", tcp_mirror: int = 0) -> None:
+        self.compact = compact
+        self.mirror = mirror
+        self.tcp = TcpMirror(tcp_mirror) if tcp_mirror else None
+        self._mirror_targets = self._parse_targets(mirror)
+        self._mirror_sock = None
+        if self._mirror_targets:
+            self._mirror_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sensing = MultiNodeSensing(port=port, sample_rate_hz=sample_rate_hz,
+                                        on_raw=self._on_raw)
+        self._last_packets = 0
+        self._last_packet_ts = time.time()
+
+    @staticmethod
+    def _parse_targets(spec: str):
+        targets = []
+        for item in (spec or "").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            host, _, port = item.rpartition(":")
+            if not host:
+                host, port = item, str(ESP32_UDP_PORT)
+            try:
+                targets.append((host, int(port)))
+            except ValueError:
+                print("[bridge] ignoring bad mirror target: %s" % item, flush=True)
+        return targets
+
+    def _on_raw(self, raw: bytes, addr) -> None:
+        if self.tcp is not None:
+            self.tcp.send(raw)
+        if self._mirror_sock is not None:
+            for host, port in self._mirror_targets:
+                try:
+                    self._mirror_sock.sendto(raw, (host, port))
+                except OSError:
+                    pass
+
+    def start(self) -> None:
+        if self.tcp is not None:
+            self.tcp.start()
+        self.sensing.start()
+        if self._mirror_targets:
+            print("[bridge] mirroring raw CSI to " +
+                  ", ".join("%s:%d" % t for t in self._mirror_targets), flush=True)
 
     def stop(self) -> None:
         try:
-            self.collector.stop()
+            self.sensing.stop()
         except Exception:  # noqa: BLE001 - shutdown must never raise
             pass
 
     def stats(self) -> dict:
-        csi = self.collector.last_csi or {}
-        return {
-            "udp_frames": self.collector.frames_received,
-            "node_id": csi.get("node_id"),
-            "seq": csi.get("sequence"),
-            "subcarriers": csi.get("n_subcarriers"),
-            "rssi_dbm": csi.get("rssi_dbm"),
-            "peer": csi.get("source_addr"),
-        }
+        return self.sensing.stats()
 
     def frame(self) -> str | None:
-        """One sensing_update JSON, or None while the window is still filling."""
-        # The collector keeps a 120 s ring buffer. Without this guard the
-        # bridge keeps re-deriving frames from that buffer after the ESP32 is
-        # unplugged, so the cloud keeps seeing `source: esp32` and the UI keeps
-        # claiming "connected" forever.
-        count = self.collector.frames_received
+        """One aggregated sensing_update JSON, or None while no node is live."""
+        packets = self.sensing.packets
         now = time.time()
-        if count != self._udp_count:
-            self._udp_count = count
-            self._udp_ts = now
-        elif now - self._udp_ts > STALE_UDP_S:
+        if packets != self._last_packets:
+            self._last_packets = packets
+            self._last_packet_ts = now
+        elif now - self._last_packet_ts > STALE_UDP_S:
+            # Never keep re-deriving frames from the buffer after the node is
+            # unplugged, otherwise the cloud keeps claiming a live link.
             return None
 
-        n_needed = int(self.server.extractor.window_seconds * self.collector.sample_rate_hz)
-        samples = self.collector.get_samples(n=n_needed)
-        if len(samples) < 4:
+        tracks = self.sensing.live_tracks()
+        if not tracks:
             return None
-        features = self.server.extractor.extract(samples)
-        result = self.server.classifier.classify(features)
-        msg = self.server._build_message(features, result)
+        msg = self.sensing.build_message()
         return _compact(msg) if self.compact else msg
 
 
 async def run(args: argparse.Namespace) -> None:
-    bridge = Bridge(port=args.port, sample_rate_hz=args.sample_rate)
+    bridge = Bridge(port=args.port, sample_rate_hz=args.sample_rate,
+                    mirror=args.mirror, tcp_mirror=args.tcp_mirror)
     bridge.start()
-    url = f"{args.target.rstrip('/')}/ws/ingest?token={args.token}"
-    print(f"[bridge] listening UDP :{args.port} -> {args.target}/ws/ingest", flush=True)
+    url = "%s/ws/ingest?token=%s" % (args.target.rstrip("/"), args.token)
+    print("[bridge] listening UDP :%d -> %s/ws/ingest" % (args.port, args.target), flush=True)
     print("[bridge] waiting for ESP32 CSI frames ...", flush=True)
 
     backoff = 2.0
@@ -127,7 +211,7 @@ async def run(args: argparse.Namespace) -> None:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20,
                                           max_size=None, open_timeout=15) as ws:
-                print(f"[bridge] connected to cloud: {args.target}", flush=True)
+                print("[bridge] connected to cloud: %s" % args.target, flush=True)
                 backoff = 2.0
                 sent = 0
                 idle_since = time.time()
@@ -143,17 +227,19 @@ async def run(args: argparse.Namespace) -> None:
                         last_report = time.time()
                     if args.verbose and time.time() - last_report >= 10:
                         s = bridge.stats()
-                        print(
-                            f"[bridge] sent={sent} udp={s['udp_frames']} "
-                            f"node={s['node_id']} seq={s['seq']} sc={s['subcarriers']} "
-                            f"rssi={s['rssi_dbm']}",
-                            flush=True,
-                        )
+                        desc = " ".join(
+                            "node%s(seq=%s sc=%s rssi=%s fps=%s frames=%s%s)" % (
+                                n["node_id"], n["seq"], n["subcarriers"],
+                                n["rssi_dbm"], n["fps"], n["frames"],
+                                " STALE" if n["stale"] else "")
+                            for n in s["nodes"]) or "no nodes"
+                        print("[bridge] sent=%d packets=%d %s" % (sent, s["packets"], desc),
+                              flush=True)
                         last_report = time.time()
                     await asyncio.sleep(args.interval)
         except Exception as exc:  # noqa: BLE001 - cloud may sleep / redeploy
-            print(f"[bridge] connection lost ({type(exc).__name__}: {exc}); "
-                  f"retry in {backoff:.0f}s", flush=True)
+            print("[bridge] connection lost (%s: %s); retry in %.0fs"
+                  % (type(exc).__name__, exc, backoff), flush=True)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
@@ -164,7 +250,12 @@ def main() -> None:
     p.add_argument("--token", default=os.environ.get("INGEST_TOKEN") or "ruview-ingest")
     p.add_argument("--port", type=int, default=ESP32_UDP_PORT, help="local ESP32 UDP port")
     p.add_argument("--sample-rate", type=float, default=10.0)
-    p.add_argument("--interval", type=float, default=0.5, help="seconds between pushes")
+    p.add_argument("--interval", type=float, default=0.5,
+                   help="seconds between pushes")
+    p.add_argument("--mirror", default="",
+                   help="comma-separated host:port list that also gets every raw UDP frame")
+    p.add_argument("--tcp-mirror", type=int, default=0,
+                   help="TCP port that streams length-prefixed raw frames to pullers")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
     try:

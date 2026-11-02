@@ -1337,17 +1337,19 @@ def build_sensing_stream_message(frame):
     out = dict(frame)
     out.setdefault("type", "sensing_update")
     cls = frame.get("classification") or {}
-    if cls.get("presence"):
+    room = build_room_state(frame)
+    presence = bool(room.get("presence"))
+    if presence:
         bbox = ws_bbox_from_field(frame.get("signal_field"))
         if bbox:
             # bbox.x / bbox.y are normalised grid centres in [0, 1].
             px = (float(bbox.get("x", 0.5)) - 0.5) * 8.0
             pz = (float(bbox.get("y", 0.5)) - 0.5) * 8.0
-            level = str(cls.get("motion_level") or "").lower()
+            level = str(room.get("motion_level") or cls.get("motion_level") or "").lower()
             out["persons"] = [
                 {
                     "person_id": 1,
-                    "confidence": float(cls.get("confidence") or 0.0),
+                    "confidence": float(room.get("confidence") or cls.get("confidence") or 0.0),
                     "position": [round(px, 3), 0.0, round(pz, 3)],
                     "id": "p0",
                     "motion_score": round(float(MOTION_SCORE.get(level, 0.4)) * 100.0, 1),
@@ -1361,8 +1363,17 @@ def build_sensing_stream_message(frame):
     # build_vital_signs(); a value that cannot be measured stays null so the HUD
     # shows "不适用" instead of a plausible-looking invention.
     out["vital_signs"] = build_vital_signs(frame)
-    out["room_state"] = build_room_state(frame)
-    out["estimated_persons"] = len(out.get("persons") or [])
+    out["room_state"] = room
+    out["estimated_persons"] = room.get("persons") if presence else 0
+    # `ui/services/websocket-client.js` only flips its banner to "真实数据 - 实时流"
+    # when the payload carries metadata.mock_data === false. Without this the 3D
+    # view kept labelling a live ESP32 stream as "模拟数据 - 演示模式".
+    out["metadata"] = {
+        "mock_data": False,
+        "source": frame.get("source") or source_name(),
+        "source_state": source_state(),
+        "node_count": node_count(frame),
+    }
     return out
 
 

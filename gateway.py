@@ -936,7 +936,7 @@ def build_info():
     state = source_state()
     return {
         "name": "RuView WiFi Sensing",
-        "version": "0.8.16",
+        "version": "0.8.17",
         "mode": "sensing-only",
         "environment": "production",
         "source": src,
@@ -1151,7 +1151,7 @@ def route(path):
         "/health/ready": {"status": "ready", "ready": True, "timestamp": time.time()},
         "/health/health": build_health,
         "/health/metrics": build_metrics,
-        "/health/version": {"version": "0.8.16", "source": "gateway"},
+        "/health/version": {"version": "0.8.17", "source": "gateway"},
         "/api/v1/info": build_info,
         "/api/v1/status": build_status,
         "/api/v1/metrics": build_metrics,
